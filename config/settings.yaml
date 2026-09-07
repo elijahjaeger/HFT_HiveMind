@@ -1,0 +1,199 @@
+# ---------------------------------------------------------------------------
+# HFT Hivemind - configuration
+#
+# SIMULATION ONLY. This project never connects to a venue and never places
+# orders. Every number below controls a local research simulation that runs on
+# DETERMINISTIC SYNTHETIC DEMO DATA.
+# ---------------------------------------------------------------------------
+
+app:
+  name: "HFT Hivemind (Research Sandbox)"
+  live_trading_enabled: false      # Hard-coded expectation: must stay false.
+  data_label: "DEMO DATA"
+
+data:
+  # Synthetic demo-data generator settings.
+  seed: 20240617                   # Seeded randomness => reproducible datasets.
+  n_markets: 8                     # Rolling sequence; more markets = better calibration splits.
+  start: "2026-01-05T09:00:00Z"
+  quote_interval_seconds: 300      # One quote snapshot every 5 minutes.
+  n_steps: 240                     # 240 steps => 20 hours of session time.
+  trades_per_step: 1.2             # Expected public tape prints per step.
+  base_spread: 0.015               # Baseline bid/ask width in probability units.
+  spread_jitter: 0.015
+  min_size: 25
+  max_size: 800
+  missing_quote_rate: 0.04         # Fraction of snapshots with a one-sided book.
+  stale_gap_rate: 0.03             # Chance a market freezes (goes stale).
+  stale_gap_steps: 12              # Length of a freeze, in steps.
+  # Markets run as a rolling sequence rather than concurrently, so a
+  # chronological calibration split has genuine train/test separation.
+  lifetime_fraction: 0.40          # How long each market lives, as a share of the session.
+  stagger_fraction: 0.60           # How far the open times are spread across the session.
+  duckdb_path: "data/processed/demo.duckdb"
+
+venues:
+  # Read-only historical-data adapters. No credentials, no order placement:
+  # these endpoints are public and the client only ever issues HTTP GET.
+  kalshi:
+    base_url: "https://external-api.kalshi.com/trade-api/v2"
+    timeout_seconds: 20
+    # Kalshi's Basic tier allows ~20 read requests/second; 5/s is deliberately
+    # conservative for a desktop research tool.
+    min_request_interval_seconds: 0.2
+    max_retries: 3
+    store_raw_responses: true       # Raw bodies are written unchanged first.
+    raw_dir: "data/raw"
+    period_interval: 60             # Candle length in minutes: 1, 60 or 1440.
+    # Candlesticks carry NO book depth. When true, each candle's traded volume
+    # stands in for displayed size so fills can be simulated; every affected
+    # quote is stamped KALSHI_CANDLES+VOLUME_DEPTH_PROXY. This is an
+    # approximation, not real depth - see the README.
+    depth_from_volume: true
+    # Kalshi order prices are $0.01-$0.99, so a $0.00 bid or $1.00 ask means
+    # "no resting order" rather than a real price.
+    treat_extremes_as_missing: true
+    fee_rate: 0.07                  # Kalshi's published trading fee coefficient.
+    include_trades: true
+    max_trade_pages: 20
+
+research:
+  # Adaptive-model research pipeline. Read-only data, local artifacts, and no
+  # deployment of any kind: promotion is a manual human decision that grants a
+  # label, not a capability. Nothing here can place an order.
+  dataset:
+    horizon_seconds: 3600          # Drop examples closer than this to close.
+    stride_seconds: 1800           # Spacing of the decision-timestamp grid.
+    short_window_seconds: 1800
+    long_window_seconds: 7200
+  readiness:
+    # Bars expressed in RESOLVED MARKETS, not rows: rows from one market share
+    # a single outcome, so rows are not independent evidence.
+    min_resolved_markets: 50
+    min_markets_per_class: 10
+  walkforward:
+    n_folds: 3
+    test_markets_per_fold: 30      # Size of each out-of-sample block, in markets.
+    validation_fraction: 0.20      # Share of the training history used to calibrate.
+    embargo_seconds: 3600          # Gap after the last training resolution.
+    calibration_method: "isotonic" # Falls back to logistic when the sample is small.
+  models:
+    logistic_regression:
+      l2: 1.0                      # Fixed, not searched: a search on this much
+      max_iterations: 50           # data would be fitting the validation set.
+    persistence_baseline:
+      shrink: 0.10
+  policy:
+    safety_margin: 0.02            # Edge demanded beyond spread, fees and slippage.
+    min_confidence: 0.0
+    max_quote_age_seconds: 900
+    reference_size: 100
+  promotion:
+    # A candidate cannot be approved unless every one of these passes.
+    min_markets: 50
+    min_folds: 3
+    require_real_data: true        # Fabricated demo data can never justify approval.
+  registry_path: "data/research/registry.duckdb"
+
+paper:
+  # Paper trading: reads live public market data, runs the same risk and
+  # execution code as the backtester, and writes HYPOTHETICAL orders and fills
+  # to a local DuckDB file. It has no order-submission code path, and every
+  # request is wrapped in a read-only guard that refuses trading endpoints.
+  enabled: true
+  venue: "kalshi"
+  tickers: []                      # Market tickers to poll, e.g. ["KXHIGHNY-25AUG31-B70"].
+  poll_interval_seconds: 60
+  execution_delay_seconds: 60      # Queued orders fill on a later poll.
+  initial_capital: 10000.0
+  decision_interval_seconds: 0     # 0 = allow a decision on every poll.
+  store_path: "data/paper/paper_trading.duckdb"
+
+agents:
+  base_rate:
+    # BaseRateAgent is an explicit PLACEHOLDER. It does not forecast anything.
+    placeholder_probability: 0.5
+    confidence: 0.05
+  tape:
+    # Reference price from recent prints. See agents/tape.py: this is a toy
+    # mean-reversion signal, not a validated forecast.
+    max_trades: 20
+    min_trades: 5
+    tape_weight: 0.85              # Weight on the trade VWAP vs the midpoint.
+    confidence: 0.40
+  imbalance:
+    # Size-weighted microprice. Always inside the spread, so it can never
+    # justify crossing that spread on its own - it only tilts the blend.
+    confidence: 0.50               # Confidence at or above the reference depth.
+    reference_depth: 200           # Contracts on the thinner side for full confidence.
+    max_data_age_seconds: 900      # Beyond this the forecast is marked DEGRADED.
+    hard_cutoff_seconds: 3600      # Beyond this it refuses to forecast at all.
+  market:
+    confidence: 0.60
+    # When only one side of the book is present, widen by this to impute a mid.
+    one_sided_adjustment: 0.01
+  liquidity:
+    max_data_age_seconds: 900
+    warn_spread: 0.04
+    warn_depth: 50
+  ensemble:
+    # Placeholder forecasts are excluded from the blended probability so the
+    # demo never pretends a hard-coded constant is a real prediction.
+    include_placeholder: false
+    weights:
+      # Weights are normalised by their total, so the MarketAgent/TapeAgent
+      # ratio is unchanged from before BookImbalanceAgent was added.
+      MarketAgent: 0.25
+      TapeAgent: 0.75
+      # Low on purpose. The microprice always sits inside the spread, so
+      # weighting it pulls the blend back toward the mid and suppresses
+      # proposals, and on the demo data it shows no Brier improvement to pay
+      # for that. See "Does the imbalance agent help?" in the README.
+      BookImbalanceAgent: 0.10
+      BaseRateAgent: 0.0           # Placeholder: never contributes to the blend.
+
+strategy:
+  # Deterministic toy strategy used to exercise the risk + execution plumbing.
+  # It is NOT a profitable strategy and is NOT trading advice.
+  min_edge: 0.02                   # Required |fair - reference| before proposing.
+  base_size: 100                   # Contracts at exactly min_edge of edge.
+  edge_size_multiplier: 1500       # Extra contracts per unit of edge.
+  max_order_size: 400
+  min_order_size: 10
+  require_positive_ev: true        # EV after fees + estimated slippage must be > 0.
+
+fills:
+  # Execution refuses to trade against a book older than this, independently of
+  # the risk agent: a feed that stopped updating is not a tradable price.
+  max_quote_age_seconds: 900
+  # A marketable limit order never fills worse than its limit. With a non-zero
+  # execution delay this is what stops the simulator filling into a gap.
+  enforce_limit_price: true
+  base_slippage: 0.002             # Constant adverse price move, probability units.
+  impact_coefficient: 0.010        # Extra slippage at 100% of displayed depth.
+  allow_partial_fills: true
+  max_fraction_of_displayed: 1.0   # Cannot take more than the displayed size.
+  min_fill_size: 1
+  fee_rate: 0.02
+  fee_model: "kalshi"              # "kalshi" => rate*size*p*(1-p); "notional" => rate*size*p.
+  tick_size: 0.01
+
+risk:
+  # Deterministic, configurable veto rules. The RiskAgent NEVER submits orders.
+  kill_switch: false               # true => every proposal is rejected.
+  max_position_size: 300           # Max |contracts| held in a single market.
+  max_event_exposure: 400.0        # Max worst-case loss ($) per market/event.
+  max_total_exposure: 1200.0       # Max worst-case loss ($) across the book.
+  max_spread: 0.06                 # Reject if bid/ask width exceeds this.
+  max_slippage: 0.02               # Reject if estimated slippage exceeds this.
+  max_data_age_seconds: 900        # Reject on stale quotes.
+  max_drawdown: 0.25               # Reject once portfolio drawdown exceeds 25%.
+
+backtest:
+  initial_capital: 10000.0
+  decision_interval_seconds: 600   # Minimum gap between decisions per market.
+  # Orders do not fill at the instant they are decided. They are queued and
+  # executed against the book in force this many seconds later.
+  execution_delay_seconds: 60
+  recent_trades_window: 20
+  record_equity_every_event: true

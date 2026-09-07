@@ -1,0 +1,29 @@
+# Tool configuration only. The project is run from the repository root; there
+# is no package to build or install.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["error::DeprecationWarning:core.*", "error::DeprecationWarning:agents.*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "D"]
+ignore = [
+    "D203",  # incompatible with D211
+    "D213",  # incompatible with D212
+    "D401",  # imperative-mood docstrings are not enforced
+    "B008",  # Streamlit and pydantic idioms rely on calls in defaults
+    "D107",  # __init__ is documented by its class docstring
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D100", "D101", "D102", "D103", "D104"]  # test names are the docs
+"conftest.py" = ["D100"]
+"app/desktop.py" = ["N802"]  # Qt overrides use camelCase method names
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"

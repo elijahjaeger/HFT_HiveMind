@@ -1,0 +1,38 @@
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local data artefacts (the demo data is regenerated deterministically)
+data/raw/*
+data/processed/*
+data/paper/*
+data/research/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/paper/.gitkeep
+!data/research/.gitkeep
+*.duckdb
+*.duckdb.wal
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

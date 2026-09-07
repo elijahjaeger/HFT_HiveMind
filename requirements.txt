@@ -1,0 +1,34 @@
+# Runtime + development dependencies (Python 3.11+).
+# Nothing here talks to a trading venue for order placement: this project is
+# simulation-only, and the venue adapters issue read-only HTTP GET requests.
+PySide6>=6.7          # Native desktop UI (Qt Widgets + QtCharts).
+duckdb>=1.0           # Local cache for datasets.
+pandas>=2.2           # Result frames.
+pydantic>=2.7         # Typed domain models.
+PyYAML>=6.0           # config/settings.yaml.
+python-dotenv>=1.0    # Optional, non-secret .env overrides.
+
+# HTTP for the read-only venue adapters uses the standard library (urllib),
+# so the venue path has no third-party network client to audit. The
+# self-learning stack below does bring its own HTTP clients (httpx, aiohttp)
+# for LLM calls; those are unused unless an LLM key is supplied AND
+# use_llm=True is passed explicitly. See DECISIONS.md.
+
+# Development
+pytest>=8.2
+ruff>=0.5
+
+# --- Self-learning architecture (src/). See DECISIONS.md 2026-09-07. ---
+# NOTE: alpaca-trade-api is deliberately NOT installed. FinRL imports it at
+# package-root, but it is a live brokerage client and pins websockets<11,
+# which breaks LangGraph. compat/ provides a refusing stub instead.
+langgraph>=1.2
+crewai>=1.15
+finrl>=0.3.7
+stable-baselines3>=2.9
+gymnasium>=1.3
+torch>=2.14
+matplotlib>=3.11
+exchange_calendars>=4.13
+stockstats>=0.6
+websockets>=14,<17
