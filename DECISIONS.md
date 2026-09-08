@@ -66,6 +66,59 @@ nothing to diff against. This file closes that gap.
 
 ---
 
+## 2026-09-08 - Simple mode, presets, and campaigns instead of single backtests
+
+**Status:** adopted.
+
+The owner is learning finance from the ground up. Thirty-five numeric controls
+and nine tabs is not a neutral default for that: a wrong value in this codebase
+produces a *plausible-looking result*, not an error, which is the worst kind of
+confusing.
+
+### Campaigns: a distribution, not a number
+
+`backtest/campaign.py` runs the same strategy many times over different random
+subsets of the same corpus for a fixed time budget, and reports the spread. A
+single backtest is a single sample; on the demo corpus the median return moves
+by more than its own size depending on which markets are drawn.
+
+The chart is a median line inside 5-95% and 25-75% percentile bands, with a
+dashed break-even line, because the question worth asking is not "is the line
+up?" but **"does the band clear zero?"** `CampaignResult.verdict()` says so in
+one sentence, and says "this has NOT been distinguished from doing nothing"
+whenever the band straddles zero - which it does on the demo data.
+
+**A campaign measures robustness to market selection, not out-of-sample
+validity.** Every run draws from the same corpus. It cannot substitute for
+walk-forward or the promotion gate, and both the module docstring and the UI
+caveat say so, because this is exactly the number a beginner would over-read.
+
+### Simple mode by default
+
+Four tabs (Backtest, Research, Corpus, Market explorer), the settings dock
+hidden, and four named presets - Cautious, Balanced, Adventurous, Do nothing -
+each carrying a plain-language summary, a list of what it changes, and **what to
+expect to see**. That last field matters most: "you will see very few trades,
+that is the preset working" turns a confusing empty table into a confirmation.
+
+One checkbox reveals all nine tabs, the full dock and the single-run detail.
+Nothing is removed, only hidden. In simple mode the preset governs and the
+hidden dock is ignored outright, because reading values the user cannot see
+would be dishonest.
+
+### Two bugs found while building it
+
+- `ProgressThrottle` (added earlier the same day) suppressed the *first* update
+  when the injected clock read below the interval - hidden in production only
+  because `time.monotonic()` returns a large number.
+- A `QAreaSeries` built from temporary `QLineSeries` is destroyed with them.
+  The band chart holds explicit references.
+
+Verification: 747 passed, 4 skipped, exit 0. ruff clean. A 6-second campaign
+through the real UI produced 35 runs, a drawn band, and an honest verdict.
+
+---
+
 ## 2026-09-08 - Job layer: live progress and cancellation
 
 **Status:** adopted.
@@ -413,7 +466,9 @@ entries above are not.
 | Mission and architecture | **Fixed 2026-09-08.** See the Mission section at the top. | - |
 | Audit debt | **Cleared.** Dead `evaluate_policy` engine removed (policy.py 417 -> 182 lines), `freshness_window` wired in, stale `corpus.py`/README concurrency claims corrected, Streamlit reference gone. | - |
 | RL stack | **Parked and uninstalled.** `src/rl_policy.py` imports optionally; `compat/` and the three root broker stubs deleted. 4 tests skip. | Unpark only with a validated forecast edge and enough independent outcomes. |
-| Job layer / app-as-product | **Done.** `core/jobs.py`; backtest and corpus loop both report progress and stop from the UI. New Corpus tab. | Extend to the Research tab's four stages, which still block without feedback. |
+| Job layer / app-as-product | **Done.** `core/jobs.py`; backtest, campaign and corpus loop all report progress and stop from the UI. | Extend to the Research tab's four stages, which still block without feedback. |
+| Learner-facing UI | **Done.** Simple mode by default (4 tabs, presets with expectations), Advanced toggle reveals everything. | Glossary surface for `presets.TERMS`; plain-language read-out on the Research tab. |
+| Evidence from backtests | **Campaigns.** Repeated resampled runs with a percentile band and a verdict that refuses to overclaim. | Run campaigns on a real corpus once a venue fills the folds. |
 | Manifold adapter | Not started. | Unblocks walk-forward with a corpus whose lifetimes actually fit the protocol. |
 | Polymarket adapter | Not started. | Real money, real book depth; addresses the 83% one-sided-book row loss. |
 | Research desk integration | `ResearchDeskAgent` exists behind `analyze()` but is not graded by walk-forward or visible in the app. | Wire into the harness so the personas are measured rather than asserted. |

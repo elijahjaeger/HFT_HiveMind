@@ -166,6 +166,52 @@ class CorpusLoopWorker(Worker):
             self.failed.emit(f"{type(error).__name__}: {error}")
 
 
+class CampaignWorker(Worker):
+    """Runs many resampled backtests for a fixed time budget, off the UI thread.
+
+    One backtest is one sample. This keeps running them over different random
+    subsets of the same corpus so the user sees a distribution of outcomes
+    rather than a single number that may be luck.
+    """
+
+    campaign_update = Signal(object)
+    """Carries a :class:`backtest.campaign.CampaignProgress`."""
+
+    def __init__(self, dataset: MarketDataset, settings: dict[str, Any],
+                 config: Any) -> None:
+        super().__init__()
+        self.dataset = dataset
+        self.settings = settings
+        self.config = config
+        self._token = CancellationToken()
+
+    def cancel(self) -> None:
+        """Stop after the current run. Completed runs are kept."""
+        self._token.cancel()
+
+    @property
+    def cancelled(self) -> bool:
+        """Whether a stop has been requested."""
+        return self._token.cancelled
+
+    def run(self) -> None:
+        """Run the campaign and emit the accumulated result."""
+        try:
+            from backtest.campaign import run_campaign
+
+            self.progress.emit("Running repeated backtests...")
+            result = run_campaign(
+                self.dataset,
+                self.settings,
+                self.config,
+                on_progress=self.campaign_update.emit,
+                should_stop=self._token,
+            )
+            self.finished.emit(result)
+        except Exception as error:  # noqa: BLE001 - surfaced in the UI
+            self.failed.emit(f"{type(error).__name__}: {error}")
+
+
 class WorkerRunner(QObject):
     """Owns a worker and the thread it runs on, and cleans both up afterwards.
 

@@ -1,4 +1,4 @@
-"""QtCharts helpers: time-series and scatter plots drawn with native widgets."""
+"""QtCharts helpers: time-series, scatter and percentile-band plots."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from datetime import datetime
 
 from PySide6.QtCharts import (
+    QAreaSeries,
     QChart,
     QChartView,
     QDateTimeAxis,
@@ -251,3 +252,129 @@ def update_reliability_chart(
     old = view.chart()
     view.setChart(fresh.chart())
     old.deleteLater()
+
+
+# --------------------------------------------------------------------------
+# Percentile band
+# --------------------------------------------------------------------------
+
+BAND_FILL = QColor("#0969da")
+BAND_FILL.setAlpha(46)
+INNER_FILL = QColor("#0969da")
+INNER_FILL.setAlpha(78)
+
+
+def _numeric_series(grid: Sequence[float], values: Sequence[float]) -> QLineSeries:
+    series = QLineSeries()
+    for x, y in zip(grid, values, strict=False):
+        series.append(float(x), 100.0 * float(y))
+    return series
+
+
+def band_chart(
+    title: str,
+    grid: Sequence[float] = (),
+    p05: Sequence[float] = (),
+    p25: Sequence[float] = (),
+    median: Sequence[float] = (),
+    p75: Sequence[float] = (),
+    p95: Sequence[float] = (),
+) -> QChartView:
+    """Chart the spread of many runs: a median line inside percentile bands.
+
+    The x-axis is *progress through a run* in [0, 1], not time, because the
+    runs being compared cover different market subsets over different spans.
+    Values are plotted as percentage returns.
+
+    A zero line is always drawn, because the question this chart exists to
+    answer is whether the band stays clear of it.
+    """
+    chart = QChart()
+    chart.setTitle(title)
+    chart.legend().setVisible(True)
+    chart.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
+
+    view = QChartView(chart)
+    view.setRenderHint(QPainter.RenderHint.Antialiasing)
+    update_band_chart(view, grid, p05, p25, median, p75, p95)
+    return view
+
+
+def update_band_chart(
+    view: QChartView,
+    grid: Sequence[float] = (),
+    p05: Sequence[float] = (),
+    p25: Sequence[float] = (),
+    median: Sequence[float] = (),
+    p75: Sequence[float] = (),
+    p95: Sequence[float] = (),
+) -> None:
+    """Redraw a band chart in place, replacing every series."""
+    chart = view.chart()
+    chart.removeAllSeries()
+    for axis in list(chart.axes()):
+        chart.removeAxis(axis)
+
+    x_axis = QValueAxis()
+    x_axis.setTitleText("Progress through run")
+    x_axis.setRange(0.0, 1.0)
+    x_axis.setLabelFormat("%.0f%%")
+    y_axis = QValueAxis()
+    y_axis.setTitleText("Return (%)")
+    chart.addAxis(x_axis, Qt.AlignmentFlag.AlignBottom)
+    chart.addAxis(y_axis, Qt.AlignmentFlag.AlignLeft)
+
+    if not grid or not median:
+        y_axis.setRange(-1.0, 1.0)
+        return
+
+    # PySide detail: an area series owns its bounding line series, and a line
+    # series held only by a temporary is collected out from under it - taking
+    # the area series with it. Keep explicit references on the view.
+    bounds = [
+        _numeric_series(grid, p95), _numeric_series(grid, p05),
+        _numeric_series(grid, p75), _numeric_series(grid, p25),
+    ]
+    view._band_refs = bounds  # noqa: SLF001 - deliberate lifetime anchor
+
+    outer = QAreaSeries()
+    outer.setUpperSeries(bounds[0])
+    outer.setLowerSeries(bounds[1])
+    outer.setName("5-95% of runs")
+    outer.setColor(BAND_FILL)
+    outer.setBorderColor(QColor("transparent"))
+
+    inner = QAreaSeries()
+    inner.setUpperSeries(bounds[2])
+    inner.setLowerSeries(bounds[3])
+    inner.setName("25-75% of runs")
+    inner.setColor(INNER_FILL)
+    inner.setBorderColor(QColor("transparent"))
+
+    middle = _numeric_series(grid, median)
+    middle.setName("Median run")
+    pen = middle.pen()
+    pen.setColor(QColor("#0a3069"))
+    pen.setWidth(3)
+    middle.setPen(pen)
+
+    # The zero line is the whole question: does the band clear it?
+    zero = QLineSeries()
+    zero.setName("Break even")
+    zero.append(0.0, 0.0)
+    zero.append(1.0, 0.0)
+    zero_pen = zero.pen()
+    zero_pen.setColor(QColor("#cf222e"))
+    zero_pen.setStyle(Qt.PenStyle.DashLine)
+    zero.setPen(zero_pen)
+
+    for series in (outer, inner, middle, zero):
+        chart.addSeries(series)
+        series.attachAxis(x_axis)
+        series.attachAxis(y_axis)
+
+    lows = [100.0 * v for v in p05] or [0.0]
+    highs = [100.0 * v for v in p95] or [0.0]
+    span = max(max(highs) - min(lows), 0.5)
+    pad = 0.15 * span
+    y_axis.setRange(min(min(lows), 0.0) - pad, max(max(highs), 0.0) + pad)

@@ -237,3 +237,67 @@ def test_the_corpus_worker_exposes_no_order_placement_surface(settings):
     worker = CorpusLoopWorker(settings, LoopConfig())
     forbidden = {"place_order", "submit_order", "create_order", "cancel_order", "post"}
     assert not (forbidden & set(dir(worker)))
+
+
+# --------------------------------------------------------------------------
+# CampaignWorker
+# --------------------------------------------------------------------------
+
+
+def test_the_campaign_worker_streams_progress_and_returns_a_distribution(
+    qapp, dataset, settings
+):
+    """One backtest is one sample; the worker exists to produce many."""
+    from app.workers import CampaignWorker
+    from backtest.campaign import CampaignConfig
+
+    worker = CampaignWorker(dataset, settings, CampaignConfig(duration_seconds=4.0))
+    seen: dict = {"updates": [], "result": None, "error": None}
+    direct = Qt.ConnectionType.DirectConnection
+    worker.campaign_update.connect(seen["updates"].append, type=direct)
+    worker.finished.connect(lambda r: seen.__setitem__("result", r), type=direct)
+    worker.failed.connect(lambda m: seen.__setitem__("error", m), type=direct)
+
+    thread = threading.Thread(target=worker.run)
+    thread.start()
+    thread.join(timeout=90)
+
+    assert not thread.is_alive()
+    assert seen["error"] is None
+    assert seen["updates"], "progress must stream, not arrive only at the end"
+    result = seen["result"]
+    assert len(result.outcomes) > 1
+    assert result.band is not None
+
+
+def test_a_cancelled_campaign_keeps_the_runs_it_finished(qapp, dataset, settings):
+    from app.workers import CampaignWorker
+    from backtest.campaign import CampaignConfig
+
+    worker = CampaignWorker(dataset, settings, CampaignConfig(duration_seconds=60.0))
+    seen: dict = {"result": None}
+    direct = Qt.ConnectionType.DirectConnection
+    worker.campaign_update.connect(
+        lambda u: worker.cancel() if u.runs >= 2 else None, type=direct
+    )
+    worker.finished.connect(lambda r: seen.__setitem__("result", r), type=direct)
+
+    started = time.monotonic()
+    thread = threading.Thread(target=worker.run)
+    thread.start()
+    thread.join(timeout=90)
+    elapsed = time.monotonic() - started
+
+    assert not thread.is_alive()
+    assert elapsed < 60.0, "a stop must not wait out the full budget"
+    assert seen["result"].cancelled is True
+    assert seen["result"].outcomes, "completed runs must survive the stop"
+
+
+def test_the_campaign_worker_exposes_no_order_placement_surface(dataset, settings):
+    from app.workers import CampaignWorker
+    from backtest.campaign import CampaignConfig
+
+    worker = CampaignWorker(dataset, settings, CampaignConfig())
+    forbidden = {"place_order", "submit_order", "create_order", "cancel_order", "post"}
+    assert not (forbidden & set(dir(worker)))

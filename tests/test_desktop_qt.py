@@ -125,19 +125,36 @@ def test_the_main_window_builds_and_loads_demo_data(qt_app):
 
         assert window.dataset is not None, "demo data never loaded"
         assert window.dataset.is_demo
-        # Asserted by name, not by count: adding a tab is not a regression,
-        # losing one is.
-        tabs = {window.tabs.tabText(i) for i in range(window.tabs.count())}
-        assert {
-            "Market explorer",
-            "Corpus",
+        # Simple mode is the default: only the surfaces needed to run an
+        # experiment and read the evidence.
+        simple = {window.tabs.tabText(i) for i in range(window.tabs.count())}
+        assert simple == {
             "Backtest",
-            "Calibration",
             "Research",
+            "Corpus",
+            "Market explorer",
+        }, f"unexpected simple-mode tabs: {simple}"
+        # isHidden() rather than isVisible(): the window itself is never
+        # shown in this test, so every child reports invisible regardless.
+        assert window.controls_dock.isHidden() is True
+        assert window.single_run_box.isHidden() is True
+        assert window.simple_mode is True
+
+        # Advanced reveals everything; nothing is removed, only hidden.
+        window.advanced_toggle.setChecked(True)
+        advanced = {window.tabs.tabText(i) for i in range(window.tabs.count())}
+        assert simple < advanced, "advanced mode must be a superset"
+        assert {
+            "Calibration",
             "Paper mode",
             "Audit log",
             "Data source",
-        } <= tabs, f"missing tab(s): {tabs}"
+            "Agents && risk",
+        } <= advanced, f"missing tab(s): {advanced}"
+        assert window.controls_dock.isHidden() is False
+        assert window.single_run_box.isHidden() is False
+        assert window.simple_mode is False
+        window.advanced_toggle.setChecked(False)
         labels = [w.text() for w in window.findChildren(QLabel)]
         assert any("LIVE TRADING DISABLED" in text for text in labels)
         assert any("DEMO DATA" in text for text in labels)

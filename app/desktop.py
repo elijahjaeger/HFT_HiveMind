@@ -52,16 +52,19 @@ from PySide6.QtWidgets import (  # noqa: E402
 )
 
 from adapters.kalshi import KalshiFetchSpec  # noqa: E402
-from app import presenter  # noqa: E402
+from app import presenter, presets  # noqa: E402
 from app.qt_charts import (  # noqa: E402
+    band_chart,
     reliability_chart,
     time_series_chart,
+    update_band_chart,
     update_chart,
     update_reliability_chart,
 )
 from app.qt_models import RowTableModel  # noqa: E402
 from app.workers import (  # noqa: E402
     BacktestWorker,
+    CampaignWorker,
     CorpusLoopWorker,
     DemoDataWorker,
     KalshiFetchWorker,
@@ -174,6 +177,7 @@ class MainWindow(QMainWindow):
         # Held only while a backtest is in flight, so Stop can reach it.
         self._backtest_worker: BacktestWorker | None = None
         self._corpus_worker: CorpusLoopWorker | None = None
+        self._campaign_worker: CampaignWorker | None = None
 
         self.setWindowTitle("HFT Hivemind - prediction-market research sandbox")
         self.resize(1400, 900)
@@ -197,22 +201,40 @@ class MainWindow(QMainWindow):
         as_of_row.addWidget(self.as_of_label)
         layout.addLayout(as_of_row)
 
+        mode_row = QHBoxLayout()
+        self.advanced_toggle = QCheckBox("Advanced mode")
+        self.advanced_toggle.setToolTip(
+            "Show every tab and the full settings panel. Simple mode keeps the "
+            "four surfaces you need to build a thesis and hides the rest."
+        )
+        self.advanced_toggle.toggled.connect(self._apply_mode)
+        mode_row.addWidget(self.advanced_toggle)
+        self.mode_hint = QLabel("")
+        self.mode_hint.setStyleSheet("color:#57606a;")
+        mode_row.addWidget(self.mode_hint, 1)
+        layout.addLayout(mode_row)
+
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_explorer_tab(), "Market explorer")
-        self.tabs.addTab(self._build_decision_tab(), "Agents && risk")
-        self.tabs.addTab(self._build_corpus_tab(), "Corpus")
-        self.tabs.addTab(self._build_backtest_tab(), "Backtest")
-        self.tabs.addTab(self._build_calibration_tab(), "Calibration")
-        self.tabs.addTab(self._build_research_tab(), "Research")
-        self.tabs.addTab(self._build_paper_tab(), "Paper mode")
-        self.tabs.addTab(self._build_audit_tab(), "Audit log")
-        self.tabs.addTab(self._build_data_tab(), "Data source")
+        # (widget, label, simple?) - simple mode shows only the surfaces needed
+        # to run experiments and read the evidence.
+        self._all_tabs = [
+            (self._build_backtest_tab(), "Backtest", True),
+            (self._build_research_tab(), "Research", True),
+            (self._build_corpus_tab(), "Corpus", True),
+            (self._build_explorer_tab(), "Market explorer", True),
+            (self._build_decision_tab(), "Agents && risk", False),
+            (self._build_calibration_tab(), "Calibration", False),
+            (self._build_paper_tab(), "Paper mode", False),
+            (self._build_audit_tab(), "Audit log", False),
+            (self._build_data_tab(), "Data source", False),
+        ]
         layout.addWidget(self.tabs, 1)
 
         self.setCentralWidget(central)
-        self.addDockWidget(
-            Qt.DockWidgetArea.LeftDockWidgetArea, self._build_controls_dock()
-        )
+        self.controls_dock = self._build_controls_dock()
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.controls_dock)
+        self._on_preset_changed()
+        self._apply_mode(False)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
@@ -607,8 +629,100 @@ class MainWindow(QMainWindow):
             )
 
     def _build_backtest_tab(self) -> QWidget:
+        """Backtest surface.
+
+        The primary control is a *campaign*: many backtests over different
+        random subsets of the same markets, so the answer is a distribution
+        rather than one number that might be luck. The single-run detail below
+        it is advanced-mode only.
+        """
         page = QWidget()
         layout = QVBoxLayout(page)
+
+        # -- preset selector (simple mode) --------------------------------
+        self.preset_box = QWidget()
+        preset_layout = QVBoxLayout(self.preset_box)
+        preset_layout.setContentsMargins(0, 0, 0, 0)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("<b>Strategy</b>"))
+        self.preset_combo = QComboBox()
+        for preset in presets.PRESETS:
+            self.preset_combo.addItem(preset.name, preset.key)
+        self.preset_combo.setCurrentIndex(
+            [p.key for p in presets.PRESETS].index(presets.DEFAULT_PRESET)
+        )
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        row.addWidget(self.preset_combo)
+        row.addStretch(1)
+        preset_layout.addLayout(row)
+
+        self.preset_summary = QLabel("")
+        self.preset_summary.setWordWrap(True)
+        preset_layout.addWidget(self.preset_summary)
+        self.preset_expect = QLabel("")
+        self.preset_expect.setWordWrap(True)
+        self.preset_expect.setStyleSheet(
+            "background:#f6f8fa; padding:8px; border-radius:4px; color:#24292f;"
+        )
+        preset_layout.addWidget(self.preset_expect)
+        layout.addWidget(self.preset_box)
+
+        # -- campaign ------------------------------------------------------
+        campaign_row = QHBoxLayout()
+        self.campaign_button = QPushButton("Run repeated backtests")
+        self.campaign_button.clicked.connect(self.run_campaign)
+        campaign_row.addWidget(self.campaign_button)
+        self.campaign_stop_button = QPushButton("Stop")
+        self.campaign_stop_button.setEnabled(False)
+        self.campaign_stop_button.clicked.connect(self._stop_campaign)
+        campaign_row.addWidget(self.campaign_stop_button)
+        campaign_row.addWidget(QLabel("for"))
+        self.campaign_duration = QComboBox()
+        for label, seconds in (
+            ("30 seconds", 30), ("2 minutes", 120), ("5 minutes", 300),
+            ("15 minutes", 900), ("1 hour", 3600),
+        ):
+            self.campaign_duration.addItem(label, seconds)
+        self.campaign_duration.setCurrentIndex(1)
+        campaign_row.addWidget(self.campaign_duration)
+        campaign_row.addStretch(1)
+        layout.addLayout(campaign_row)
+
+        explainer = QLabel(presets.CAMPAIGN_EXPLAINER)
+        explainer.setWordWrap(True)
+        layout.addWidget(explainer)
+
+        self.campaign_progress = QProgressBar()
+        self.campaign_progress.setRange(0, 100)
+        self.campaign_progress.setVisible(False)
+        layout.addWidget(self.campaign_progress)
+
+        self.campaign_stats = QLabel("No runs yet.")
+        self.campaign_stats.setStyleSheet("font-size:14px;")
+        layout.addWidget(self.campaign_stats)
+
+        self.band_chart_view = band_chart("Return across repeated runs")
+        self.band_chart_view.setMinimumHeight(320)
+        layout.addWidget(self.band_chart_view, 3)
+
+        self.campaign_verdict = QLabel("")
+        self.campaign_verdict.setWordWrap(True)
+        self.campaign_verdict.setStyleSheet(
+            "background:#fff8c5; padding:8px; border-radius:4px;"
+        )
+        layout.addWidget(self.campaign_verdict)
+
+        caveat = QLabel(presets.CAMPAIGN_CAVEAT)
+        caveat.setWordWrap(True)
+        caveat.setStyleSheet("color:#57606a; font-size:11px;")
+        layout.addWidget(caveat)
+
+        # -- single-run detail (advanced only) -----------------------------
+        self.single_run_box = QWidget()
+        single_layout = QVBoxLayout(self.single_run_box)
+        single_layout.setContentsMargins(0, 12, 0, 0)
+        single_layout.addWidget(QLabel("<b>Single run detail</b>"))
+        layout.addWidget(self.single_run_box, 2)
 
         controls = QHBoxLayout()
         self.run_button = QPushButton("Run backtest")
@@ -629,7 +743,7 @@ class MainWindow(QMainWindow):
         note.setStyleSheet("color:#57606a;")
         note.setWordWrap(True)
         controls.addWidget(note, 1)
-        layout.addLayout(controls)
+        single_layout.addLayout(controls)
 
         # Determinate bar, distinct from the window-level marquee used by the
         # data-loading flows.
@@ -637,17 +751,17 @@ class MainWindow(QMainWindow):
         self.backtest_progress.setRange(0, 100)
         self.backtest_progress.setValue(0)
         self.backtest_progress.setVisible(False)
-        layout.addWidget(self.backtest_progress)
+        single_layout.addWidget(self.backtest_progress)
 
         self.backtest_live_label = QLabel("")
         self.backtest_live_label.setStyleSheet("color:#57606a;")
-        layout.addWidget(self.backtest_live_label)
+        single_layout.addWidget(self.backtest_live_label)
         self.backtest_audit_label = QLabel("")
         self.backtest_audit_label.setStyleSheet("color:#57606a; font-family:monospace;")
-        layout.addWidget(self.backtest_audit_label)
+        single_layout.addWidget(self.backtest_audit_label)
 
         self.metric_row = QHBoxLayout()
-        layout.addLayout(self.metric_row)
+        single_layout.addLayout(self.metric_row)
 
         charts = QSplitter(Qt.Orientation.Vertical)
         self.equity_chart = time_series_chart("Equity curve (simulated)", {}, y_title="Equity $")
@@ -660,7 +774,7 @@ class MainWindow(QMainWindow):
         charts.addWidget(self.drawdown_chart)
         charts.setSizes([340, 260])
         charts.setMinimumHeight(510)
-        layout.addWidget(charts, 3)
+        single_layout.addWidget(charts, 3)
 
         tables = QSplitter(Qt.Orientation.Horizontal)
         metrics_panel = QWidget()
@@ -684,8 +798,88 @@ class MainWindow(QMainWindow):
         decisions_layout.addWidget(table_view(self.decisions_model))
         tables.addWidget(decisions_panel)
         tables.setSizes([420, 420, 460])
-        layout.addWidget(tables, 2)
+        single_layout.addWidget(tables, 2)
         return page
+
+    def _on_preset_changed(self) -> None:
+        """Show what the chosen preset does and what to expect from it."""
+        preset = presets.get(self.preset_combo.currentData())
+        changes = "".join(f"<li>{c}</li>" for c in preset.changes)
+        self.preset_summary.setText(
+            f"<b>{preset.summary}</b><ul style='margin-top:4px;'>{changes}</ul>"
+        )
+        self.preset_expect.setText(f"<b>What to expect:</b> {preset.expect}")
+
+    def run_campaign(self) -> None:
+        """Run many backtests over resampled markets for the chosen duration."""
+        if self.dataset is None:
+            QMessageBox.information(self, "No data", "Load a dataset first.")
+            return
+        from backtest.campaign import CampaignConfig
+
+        config = CampaignConfig(
+            duration_seconds=float(self.campaign_duration.currentData())
+        )
+        self.campaign_button.setEnabled(False)
+        self.campaign_stop_button.setEnabled(True)
+        self.campaign_progress.setValue(0)
+        self.campaign_progress.setVisible(True)
+        self.campaign_verdict.setText("")
+        self.campaign_stats.setText("Starting...")
+
+        worker = CampaignWorker(self.dataset, self.active_settings(), config)
+        self._campaign_worker = worker
+        worker.campaign_update.connect(self._on_campaign_progress)
+        self._start(worker, self._on_campaign_finished)
+
+    def _on_campaign_progress(self, update: Any) -> None:
+        """Redraw the band as runs accumulate."""
+        self.campaign_progress.setValue(update.percent)
+        self.campaign_stats.setText(
+            f"<b>{update.runs}</b> runs  ·  median return "
+            f"<b>{update.median_return:+.2%}</b>  ·  "
+            f"{update.win_rate:.0%} of runs profitable  ·  "
+            f"{update.elapsed:.0f}s of {update.duration:.0f}s"
+        )
+        band = update.band
+        if band is not None:
+            update_band_chart(
+                self.band_chart_view, band.grid, band.p05, band.p25,
+                band.median, band.p75, band.p95,
+            )
+
+    def _stop_campaign(self) -> None:
+        """Stop after the current run. Completed runs are kept."""
+        if self._campaign_worker is None:
+            return
+        self._campaign_worker.cancel()
+        self.campaign_stop_button.setEnabled(False)
+        self.campaign_stats.setText("Stopping after the current run...")
+
+    def _on_campaign_finished(self, result: Any) -> None:
+        """Show the verdict - the sentence that actually matters."""
+        self.progress.setVisible(False)
+        self.campaign_button.setEnabled(True)
+        self.campaign_stop_button.setEnabled(False)
+        self.campaign_progress.setVisible(False)
+        self._campaign_worker = None
+
+        band = result.band
+        if band is not None:
+            update_band_chart(
+                self.band_chart_view, band.grid, band.p05, band.p25,
+                band.median, band.p75, band.p95,
+            )
+        self.campaign_stats.setText(
+            f"<b>{len(result.outcomes)}</b> runs in {result.elapsed:.0f}s  ·  median "
+            f"return <b>{result.median_return:+.2%}</b>  ·  "
+            f"{result.win_rate:.0%} of runs profitable"
+            + ("  ·  stopped early" if result.cancelled else "")
+        )
+        notes = " ".join(result.notes)
+        self.campaign_verdict.setText(
+            f"<b>{result.verdict()}</b>" + (f"<br><br>{notes}" if notes else "")
+        )
 
     def _build_calibration_tab(self) -> QWidget:
         page = QWidget()
@@ -1462,6 +1656,49 @@ class MainWindow(QMainWindow):
         return page
 
     # -- data loading ------------------------------------------------------
+
+    def _apply_mode(self, advanced: bool) -> None:
+        """Show or hide everything that is not needed to run an experiment.
+
+        Simple mode is the default because thirty-five numeric controls do not
+        help someone who does not yet know what they do - and a wrong value
+        produces a plausible-looking result rather than an error.
+        """
+        self.simple_mode = not advanced
+        current = self.tabs.tabText(self.tabs.currentIndex()) if self.tabs.count() else ""
+
+        while self.tabs.count():
+            self.tabs.removeTab(0)
+        for widget, label, in_simple in self._all_tabs:
+            if advanced or in_simple:
+                self.tabs.addTab(widget, label)
+        for index in range(self.tabs.count()):
+            if self.tabs.tabText(index) == current:
+                self.tabs.setCurrentIndex(index)
+                break
+
+        self.controls_dock.setVisible(advanced)
+        if hasattr(self, "single_run_box"):
+            self.single_run_box.setVisible(advanced)
+        if hasattr(self, "preset_box"):
+            self.preset_box.setVisible(not advanced)
+        self.mode_hint.setText(
+            "Every tab and all settings are visible. The preset selector is off; "
+            "the left panel is in charge."
+            if advanced
+            else "Showing the four surfaces you need. Tick Advanced for the rest."
+        )
+
+    def active_settings(self) -> dict[str, Any]:
+        """The settings a run should actually use.
+
+        In simple mode the chosen preset governs, because the settings panel is
+        hidden and reading values the user cannot see would be dishonest. In
+        advanced mode the panel is in charge.
+        """
+        if getattr(self, "simple_mode", True):
+            return presets.apply(get_settings(), self.preset_combo.currentData())
+        return self.collect_settings()
 
     def collect_settings(self) -> dict[str, Any]:
         """Read every control back into a settings dictionary."""
