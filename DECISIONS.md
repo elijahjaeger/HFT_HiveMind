@@ -1,3 +1,59 @@
+# Mission
+
+**Find a real, validated forecasting edge in prediction markets - and make it as
+hard as possible to believe in one that is not there.**
+
+Both halves are the mission. The second is why the first is worth anything: a
+research pipeline that cannot tell you "no" cannot tell you "yes" either. Every
+guard in this codebase exists because the failure mode being defended against
+is not losing money, it is *being convinced you found something*.
+
+## Scope boundaries
+
+These are not aspirations. They are constraints that shape the code.
+
+1. **This repository never executes an order.** It has no order-placement code
+   path, no credentials, and no live-trading toggle, and it never will. If an
+   edge validates, a **physically separate application** - own repository, own
+   credentials, own review - performs execution, consuming approved artifacts
+   from this one. The boundary is a repository boundary, not a config flag.
+   Recorded 2026-09-08.
+2. **Evidence is counted in resolved markets.** Never rows, never timesteps,
+   never training steps. A market forecast 400 times resolves once.
+3. **The promotion gate is the arbiter and is never loosened to make a run
+   pass.** Parameters may change with a recorded justification; they may not
+   change *in response to a failing run*.
+4. **Real data or it does not count.** Synthetic corpora prove the machinery,
+   never the strategy.
+
+## Architecture
+
+Six layers, each depending only on those above it.
+
+| Layer | Responsibility | Modules |
+| --- | --- | --- |
+| **Venue adapters** | Read-only historical data, one class per venue behind a shared protocol | `adapters/` (Kalshi live-proven; Manifold next; Polymarket after) |
+| **Core domain** | Typed models, the causal `MarketState`, provenance-preserving storage | `core/` |
+| **Forecasters** | Anything that produces a probability behind `analyze()` | `agents/`, `src/research_desk.py` |
+| **Research** | Labels, causal features, walk-forward, calibration, drift, registry, gate | `research/`, `calibration/` |
+| **Execution simulation** | Frictions, risk veto, event loop, paper loop. Terminates in an in-memory portfolio | `backtest/`, `paper/` |
+| **Product surface** | The Qt desktop application, driven by a shared job layer | `app/` |
+
+**The application is the product.** Long-running work - corpus pulls,
+walk-forward, backtests - runs through one job layer that both the UI and the
+CLI drive, so a run behaves identically either way and progress and
+cancellation work everywhere.
+
+## What success looks like
+
+A forecaster that clears the promotion gate on real data from at least one
+venue: 50+ resolved out-of-sample markets, 3+ usable walk-forward folds, beating
+the frozen market-price baseline, with calibration that holds. Then months of
+paper trading whose realised calibration matches the backtest. Only then does
+the question of a separate execution application arise.
+
+---
+
 # Decisions log
 
 Append-only. Newest first. Each entry records what changed, why, and what it
@@ -7,6 +63,49 @@ Before this file existed the recorded intent lived in `README.md` prose and
 `research/README_DESIGN.md`. An audit on 2026-09-07 found no structured log and
 no version control, meaning a change had nowhere to record its rationale and
 nothing to diff against. This file closes that gap.
+
+---
+
+## 2026-09-08 - Mission and architecture fixed; direction set
+
+**Status:** adopted.
+
+Eight decisions taken with the user, establishing the Mission section above.
+
+| Question | Decision |
+| --- | --- |
+| What is this for? | Find real edge, eventually trade it |
+| The orphaned `src/` layer | Integrate the research desk; park the RL policy |
+| Role of the Qt app | The app is the product |
+| The empty-folds blocker | Add venues rather than retune walk-forward |
+| Live-trading boundary | **Never in this repository** - a separate execution application |
+| Next venues | Both, **Manifold first**, then Polymarket |
+| RL dependencies | Remove from the tree, keep the code behind an optional import |
+| First slice | Clean up the audit debt, then build the job layer |
+
+### Why Manifold before Polymarket
+
+Manifold is play money, so an edge found there is not tradable. That is
+acceptable because the immediate blocker is *scientific, not financial*: every
+walk-forward training fold purges to zero on Kalshi's short-horizon settled
+markets, so the protocol has never once produced a usable fold on real data.
+Manifold offers a large corpus of resolved markets with varied lifetimes and a
+simple API - the cheapest way to prove the machinery works on a corpus that
+actually fits. Polymarket then answers the real-money question with genuine
+order-book depth, which also addresses the 83% row loss from one-sided books.
+
+### Why the RL dependencies come out
+
+`src/rl_policy.py` is parked, and a control policy cannot improve accuracy until
+there is a validated forecast edge *and* enough independent outcomes - neither
+of which holds. torch, FinRL, stable-baselines3 and gymnasium cost roughly 2GB
+and force `compat/` to keep stub modules named after a live brokerage client at
+the repository root, which is a poor thing to have in a tree whose central claim
+is that it cannot trade. The code stays, behind an optional import, and the
+decision reverses with one `pip install`.
+
+This does not supersede the 2026-09-07 entry admitting RL. RL remains part of
+the architecture; it is unfunded, not unwanted.
 
 ---
 
@@ -252,26 +351,35 @@ entries above are not.
 
 | Track | State | Next |
 | --- | --- | --- |
-| Read-only Kalshi adapter | **Working against the live venue.** First exercised for real 2026-09-08; 50 tests remain fixture-only. | Guard the candlestick call inside `fetch_dataset` so one bad ticker skips itself rather than aborting the batch (`run_loop` chunks around this today). |
-| Research pipeline on real data | **Runs end-to-end.** 2,000 markets pulled, 127 resolved, 6,769 labelled rows, "Real market data" gate check passing. | Blocked on the fold question below. |
-| Walk-forward on Kalshi | **Blocked.** All folds purge to an empty training set. | Needs a human decision: change the market universe, or change the fold parameters. |
-| Promotion gate | Never passed. Never bypassed. | Unchanged - it is doing its job. |
-| Calibration | Only ever run on synthetic corpora. | Reachable once folds are usable. |
-| Self-learning layer (`src/`) | Built, tested, runs on the demo corpus. | Has not been pointed at the real Kalshi corpus. |
-| Paper trading | Unchanged, offline-capable, no order path. | Settlement detection (README roadmap 5). |
+| Mission and architecture | **Fixed 2026-09-08.** See the Mission section at the top. | - |
+| Audit debt | **Cleared.** Dead `evaluate_policy` engine removed (policy.py 417 -> 182 lines), `freshness_window` wired in, stale `corpus.py`/README concurrency claims corrected, Streamlit reference gone. | - |
+| RL stack | **Parked and uninstalled.** `src/rl_policy.py` imports optionally; `compat/` and the three root broker stubs deleted. 4 tests skip. | Unpark only with a validated forecast edge and enough independent outcomes. |
+| Job layer / app-as-product | **Not started. Next slice.** | Progress + cancellation for backtests, then the corpus loop driven and stoppable from the UI. A design already exists at `docs/design/live-backtest-progress-and-stop.md`. |
+| Manifold adapter | Not started. | Unblocks walk-forward with a corpus whose lifetimes actually fit the protocol. |
+| Polymarket adapter | Not started. | Real money, real book depth; addresses the 83% one-sided-book row loss. |
+| Research desk integration | `ResearchDeskAgent` exists behind `analyze()` but is not graded by walk-forward or visible in the app. | Wire into the harness so the personas are measured rather than asserted. |
+| Read-only Kalshi adapter | Working against the live venue. 50 tests remain fixture-only. | Guard the candlestick call inside `fetch_dataset` so one bad ticker skips itself. |
+| Research pipeline on real data | Runs end-to-end; "Real market data" gate check passing. | Blocked on corpus shape, not on code. |
+| Walk-forward on Kalshi | Blocked - all training folds purge to empty. | Superseded by "add venues" rather than retuning. |
+| Promotion gate | Never passed. Never bypassed. | Unchanged. |
+| Paper trading | Offline-capable, no order path. | Settlement detection (README roadmap 5). |
+| Execution | **Out of scope for this repository, permanently.** | A separate application, if an edge ever validates. |
 
 # Open questions
 
-1. **Which market universe?** Kalshi's settled population in the sampled window
-   is overwhelmingly short-lived and concurrent, which the purge rule correctly
-   empties. Long-lived sequential series exist (`KXFEDDECISION` markets live
-   months) but choosing them is a selection decision with bias consequences.
-2. **Are the walk-forward parameters right for real data?** `n_folds=3 x
-   test_markets_per_fold=30` needs 90 test markets *plus* a surviving training
-   set. They were set against a synthetic corpus shaped to satisfy them.
-3. **Is a candle-derived book good enough?** 83% of feature rows were dropped for
-   having no two-sided book. If that holds on any real corpus, the feature set
-   may need to tolerate one-sided quotes rather than discard them.
-4. **Should `min_lifetime_hours` be derived rather than configured?** It is
-   currently a constant that must be kept above `research.dataset.horizon_seconds`
-   by hand; a test asserts the relationship but nothing enforces it at runtime.
+1. **Will Manifold's corpus actually fill the folds?** The hypothesis is that
+   varied market lifetimes give the sequential structure Kalshi's short-horizon
+   settled markets lack. If it does not, the walk-forward parameters become the
+   next suspect rather than the data.
+2. **Is a candle-derived book good enough?** 83% of Kalshi feature rows were
+   dropped for having no two-sided book. Polymarket's CLOB should answer this;
+   if the loss persists, the feature set may need to tolerate one-sided quotes.
+3. **Should `min_lifetime_hours` be derived rather than configured?** It must
+   stay above `research.dataset.horizon_seconds`; a test asserts the
+   relationship but nothing enforces it at runtime.
+4. **How much of `src/` survives the job layer?** The LangGraph supervisor and a
+   job/orchestration layer are two answers to overlapping questions. One of them
+   should probably go.
+5. **What are the paper-trading criteria for the separate execution app?** The
+   boundary is agreed; the bar that would justify crossing it is not yet
+   written down.

@@ -18,17 +18,22 @@ python-dotenv>=1.0    # Optional, non-secret .env overrides.
 pytest>=8.2
 ruff>=0.5
 
-# --- Self-learning architecture (src/). See DECISIONS.md 2026-09-07. ---
-# NOTE: alpaca-trade-api is deliberately NOT installed. FinRL imports it at
-# package-root, but it is a live brokerage client and pins websockets<11,
-# which breaks LangGraph. compat/ provides a refusing stub instead.
+# --- Agent layer (src/). See DECISIONS.md 2026-09-07 and 2026-09-08. ---
 langgraph>=1.2
 crewai>=1.15
-finrl>=0.3.7
-stable-baselines3>=2.9
-gymnasium>=1.3
-torch>=2.14
-matplotlib>=3.11
-exchange_calendars>=4.13
-stockstats>=0.6
 websockets>=14,<17
+
+# --- Reinforcement learning: PARKED, deliberately not installed ---
+# src/rl_policy.py imports these optionally and reports RL_AVAILABLE=False
+# without them; only training raises. A control policy cannot improve accuracy
+# until there is a validated forecast edge and enough independent outcomes, and
+# neither holds yet. Leaving them out also keeps FinRL's live-brokerage client
+# (alpaca-trade-api, which additionally pins websockets<11 and breaks LangGraph)
+# out of a repository whose central claim is that it cannot trade.
+# To unpark:
+#     pip install stable-baselines3 gymnasium
+#     finrl>=0.3.7        # optional; SB3 alone is enough for src/rl_policy.py
+#
+#   stable-baselines3>=2.9
+#   gymnasium>=1.3
+#   torch>=2.14

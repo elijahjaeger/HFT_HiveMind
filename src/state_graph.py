@@ -145,6 +145,12 @@ class TradingGraph:
                 f"rl_policy: trained {metrics.timesteps} steps over "
                 f"{metrics.effective_n} resolved market(s)"
             )
+        except ImportError as error:
+            # The RL stack is parked and not installed by default. The graph
+            # still routes through this node and reports why it did nothing,
+            # rather than failing the whole run. See DECISIONS.md 2026-09-08.
+            metrics = PolicyMetrics(warnings=[str(error)])
+            note = "rl_policy: skipped, RL stack not installed (parked by design)"
         except (ValueError, RuntimeError) as error:
             metrics = PolicyMetrics(warnings=[f"training skipped: {error}"])
             note = f"rl_policy: skipped ({type(error).__name__}: {error})"

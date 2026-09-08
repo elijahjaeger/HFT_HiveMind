@@ -16,9 +16,14 @@ try:
 
     # 1. Check Framework Imports
     import crewai  # noqa: F401 - imported to prove availability
-    import finrl  # noqa: F401 - imported to prove availability
     import langgraph  # noqa: F401 - imported to prove availability
-    print("✅ Core Frameworks (LangGraph, CrewAI, FinRL) installed and importable.")
+    print("✅ Core frameworks (LangGraph, CrewAI) installed and importable.")
+
+    # The RL stack is parked and deliberately NOT a requirement.
+    # See DECISIONS.md (2026-09-08).
+    import src.rl_policy
+    state = "installed" if src.rl_policy.RL_AVAILABLE else "not installed (parked)"
+    print(f"ℹ️  RL stack (FinRL/SB3/gymnasium): {state}")
 
     # 2. Check Your Implementation Modules (Adjust filenames to match your project)
     import src.research_desk  # Your CrewAI implementation
@@ -38,7 +43,7 @@ try:
     assert hasattr(src.rl_policy, "AlphaTradingEnv"), "no RL environment"
     print(f"✅ Graph compiled, nodes: {sorted(nodes)}")
     print(f"✅ CrewAI personas: {sorted(personas)}")
-    print("✅ FinRL/SB3 policy pipeline exposes train() over AlphaTradingEnv.")
+    print("✅ RL policy pipeline exposes train() over AlphaTradingEnv.")
 
     print("🚀 Architecture Verification: SUCCESS")
     sys.exit(0) # Exit with 0 means success

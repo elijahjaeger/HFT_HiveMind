@@ -19,8 +19,11 @@ cannot pay the spread scores badly here, which is the point.
 
 **Simulation-only is unchanged.** The action space terminates in
 ``simulate_fill`` and an in-memory portfolio. There is no order-placement
-method on this class, no venue handle, and no credential use. FinRL's own
-broker clients are stubbed out by ``compat/`` and raise if touched.
+method on this class, no venue handle, and no credential use.
+
+**The RL stack is optional and not installed by default** - see the import
+block below and ``DECISIONS.md`` (2026-09-08). This module imports cleanly
+without it; only training raises.
 
 The sample-size caveat that governs everything
 ----------------------------------------------
@@ -39,22 +42,44 @@ from typing import Any
 
 import numpy as np
 
-try:  # gymnasium ships with stable-baselines3
-    import gymnasium as gym
-    from gymnasium import spaces
-except ImportError as error:  # pragma: no cover - dependency guard
-    raise ImportError(
-        "src.rl_policy requires gymnasium (installed with stable-baselines3)"
-    ) from error
-
-from stable_baselines3 import PPO
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv
-
 from backtest.fills import simulate_fill
 from core.dataset import MarketDataset
 from core.models import Side
 from src.contracts import ALPHA_FEATURE_NAMES, AlphaVector, PolicyMetrics
+
+# The RL stack is optional and not installed by default. It is parked, not
+# unwanted: a control policy cannot improve accuracy until there is a validated
+# forecast edge and enough independent outcomes, and neither holds yet. Keeping
+# torch/FinRL/SB3 out of the tree also lets compat/ - stub modules named after a
+# live brokerage client - be deleted from a repository whose central claim is
+# that it cannot trade. See DECISIONS.md (2026-09-08).
+#
+#   pip install stable-baselines3 gymnasium
+#
+# reverses this. The module imports cleanly either way, so anything that only
+# needs ACTION_NAMES or PolicyMetrics keeps working.
+try:
+    import gymnasium as gym
+    from gymnasium import spaces
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.monitor import Monitor
+    from stable_baselines3.common.vec_env import DummyVecEnv
+
+    RL_AVAILABLE = True
+    _EnvBase: Any = gym.Env
+except ImportError:  # pragma: no cover - exercised by the absence of the deps
+    gym = None  # type: ignore[assignment]
+    spaces = None  # type: ignore[assignment]
+    PPO = Monitor = DummyVecEnv = None  # type: ignore[assignment]
+    RL_AVAILABLE = False
+    _EnvBase = object
+
+RL_MISSING_MESSAGE = (
+    "The reinforcement-learning stack is not installed. It is parked by design "
+    "(DECISIONS.md 2026-09-08). Install it with: "
+    "pip install stable-baselines3 gymnasium"
+)
+
 
 RL_POLICY_VERSION = "ppo-alpha-v1"
 
@@ -68,7 +93,7 @@ _PORTFOLIO_FEATURES = ("position_fraction", "cash_fraction", "step_fraction")
 OBSERVATION_NAMES: tuple[str, ...] = (*ALPHA_FEATURE_NAMES, *_PORTFOLIO_FEATURES)
 
 
-class AlphaTradingEnv(gym.Env):
+class AlphaTradingEnv(_EnvBase):
     """One episode = one market, walked forward over its alpha vectors."""
 
     metadata = {"render_modes": []}
@@ -81,6 +106,8 @@ class AlphaTradingEnv(gym.Env):
         order_size: float = 100.0,
         initial_capital: float = 10_000.0,
     ) -> None:
+        if not RL_AVAILABLE:
+            raise ImportError(RL_MISSING_MESSAGE)
         super().__init__()
         self.dataset = dataset
         self.settings = dict(settings or {})
@@ -224,10 +251,10 @@ class RLPolicyPipeline:
         self.model: PPO | None = None
         self.metrics = PolicyMetrics(model_version=RL_POLICY_VERSION)
 
-    def build_env(
-        self, dataset: MarketDataset, alpha: list[AlphaVector]
-    ) -> DummyVecEnv:
+    def build_env(self, dataset: MarketDataset, alpha: list[AlphaVector]) -> Any:
         """Group alpha vectors by market and wrap the environment for SB3."""
+        if not RL_AVAILABLE:
+            raise ImportError(RL_MISSING_MESSAGE)
         by_market: dict[str, list[AlphaVector]] = {}
         for vector in alpha:
             by_market.setdefault(vector.market_id, []).append(vector)
@@ -237,7 +264,7 @@ class RLPolicyPipeline:
         backtest_cfg = self.settings.get("backtest", {})
         strategy_cfg = self.settings.get("strategy", {})
 
-        def _make() -> gym.Env:
+        def _make() -> Any:
             return Monitor(
                 AlphaTradingEnv(
                     dataset=dataset,
@@ -259,6 +286,8 @@ class RLPolicyPipeline:
         is not evidence of anything: what matters downstream is the metric set
         and the ``effective_n`` attached to it.
         """
+        if not RL_AVAILABLE:
+            raise ImportError(RL_MISSING_MESSAGE)
         env = self.build_env(dataset, alpha)
         traded_markets = {v.market_id for v in alpha}
         resolved = {

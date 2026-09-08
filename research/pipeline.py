@@ -40,7 +40,12 @@ from research.evaluate import (
     score_report,
 )
 from research.models import DEFAULT_BASELINES
-from research.policy import ModelForecastAgent, PolicyConfig, strategy_config_for
+from research.policy import (
+    ModelForecastAgent,
+    PolicyConfig,
+    freshness_window,
+    strategy_config_for,
+)
 from research.registry import PromotionGate, ResearchRegistry, evaluate_promotion_gate
 from research.skips import SkippedDecision, skip_summary
 from research.walkforward import WalkForwardReport, run_walk_forward
@@ -296,7 +301,7 @@ def run_model_backtest(
     stride = float(
         research_cfg.get("dataset", {}).get("stride_seconds", 1800.0)
     )
-    agent = ModelForecastAgent(forecasts, max_age_seconds=stride * 1.5)
+    agent = ModelForecastAgent(forecasts, max_age_seconds=freshness_window(stride))
 
     run_settings = dict(settings)
     run_settings["strategy"] = {

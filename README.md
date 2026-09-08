@@ -420,10 +420,13 @@ An **embargo** then skips a configurable gap after the last training resolution.
 invariant the tests assert: *every training market resolves at least `embargo_seconds`
 before the earliest test decision timestamp.*
 
-This is expensive, and visibly so. On a corpus where ~50 markets are open at once, the
-purge removes nearly everything and folds come back empty. That is the guard working. The
-synthetic research corpus therefore uses short-lived markets spread over a long span
-(~7 concurrent), which is what real sequential market data looks like.
+This is expensive, and visibly so. Where markets overlap heavily the purge removes
+nearly everything and folds come back empty. That is the guard working, and it is what
+happened on real Kalshi data: 2,000 settled markets produced 127 resolved ones and
+**zero** usable folds, because every training market resolved after the first test
+decision timestamp (see `DECISIONS.md`, 2026-09-08). The synthetic research corpus
+therefore uses short-lived markets spread over a long span (~7 concurrent), which is what
+sequentially-resolving market data looks like.
 
 ### Models
 

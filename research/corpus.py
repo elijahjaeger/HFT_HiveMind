@@ -13,11 +13,15 @@ Two sources are supported:
 Why the synthetic corpus is shaped the way it is
 ------------------------------------------------
 
-The default demo dataset runs its markets concurrently: around fifty are open
-at once. That is fine for the trading dashboard, but it makes a rigorous
-walk-forward split nearly empty, because almost every training market is still
-unresolved when the test window opens and is therefore purged. That is the
-purge doing its job, not a bug.
+Heavily overlapping markets make a rigorous walk-forward split nearly empty:
+almost every training market is still unresolved when the test window opens and
+is therefore purged. That is the purge doing its job, not a bug, and it is
+exactly what happened on real Kalshi data - every training fold came back empty
+(see DECISIONS.md 2026-09-08).
+
+The bundled demo dataset avoids this by running its markets as a rolling
+sequence rather than concurrently (see ``lifetime_fraction`` and
+``stagger_fraction`` in ``config/settings.yaml``).
 
 A research corpus therefore uses short-lived markets spread over a long span,
 so markets resolve in a rolling sequence and there is genuine chronological

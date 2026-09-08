@@ -16,7 +16,7 @@ ignore = [
     "D203",  # incompatible with D211
     "D213",  # incompatible with D212
     "D401",  # imperative-mood docstrings are not enforced
-    "B008",  # Streamlit and pydantic idioms rely on calls in defaults
+    "B008",  # pydantic idioms rely on calls in argument defaults
     "D107",  # __init__ is documented by its class docstring
 ]
 

@@ -25,8 +25,18 @@ from src.research_desk import (
     build_personas,
     llm_is_configured,
 )
-from src.rl_policy import OBSERVATION_NAMES, AlphaTradingEnv, RLPolicyPipeline
+from src.rl_policy import (
+    OBSERVATION_NAMES,
+    RL_AVAILABLE,
+    AlphaTradingEnv,
+    RLPolicyPipeline,
+)
 from src.state_graph import _PIPELINE, TradingGraph, build_states, compile_graph
+
+requires_rl = pytest.mark.skipif(
+    not RL_AVAILABLE,
+    reason="RL stack is parked; pip install stable-baselines3 gymnasium",
+)
 
 
 @pytest.fixture(scope="module")
@@ -156,6 +166,7 @@ def test_the_observation_space_is_alpha_plus_portfolio_state():
     assert len(OBSERVATION_NAMES) == len(ALPHA_FEATURE_NAMES) + 3
 
 
+@requires_rl
 def test_the_environment_refuses_a_corpus_with_nothing_to_settle(settings, dataset):
     with pytest.raises(ValueError, match="settled outcome"):
         AlphaTradingEnv(dataset, alpha_by_market={}, settings=settings)
@@ -169,6 +180,7 @@ def _alpha_over_time(settings, dataset, n: int = 6) -> list[AlphaVector]:
     return [v for ts in picked for v in desk.run(build_states(dataset, ts)) if v.has_view]
 
 
+@requires_rl
 def test_training_reports_evidence_in_resolved_markets(settings, dataset):
     alpha = _alpha_over_time(settings, dataset)
     pipeline = RLPolicyPipeline(settings, total_timesteps=256)
@@ -179,6 +191,7 @@ def test_training_reports_evidence_in_resolved_markets(settings, dataset):
     assert metrics.is_synthetic is True
 
 
+@requires_rl
 def test_the_gate_refuses_a_policy_trained_on_fabricated_data(settings, dataset):
     pipeline = RLPolicyPipeline(settings, total_timesteps=256)
     pipeline.train(dataset, _alpha_over_time(settings, dataset))
@@ -187,6 +200,7 @@ def test_the_gate_refuses_a_policy_trained_on_fabricated_data(settings, dataset)
     assert any("Fabricated" in f for f in failures)
 
 
+@requires_rl
 def test_the_gate_counts_markets_not_timesteps(settings, dataset):
     pipeline = RLPolicyPipeline(settings, total_timesteps=256)
     pipeline.train(dataset, _alpha_over_time(settings, dataset))
@@ -242,12 +256,18 @@ def test_the_graph_stops_after_its_configured_cycle_count(settings, dataset, as_
 # --------------------------------------------------------------------------
 
 
-def test_the_stubbed_broker_clients_refuse_to_be_used():
-    import alpaca_trade_api
-    from compat import RefusedExternalClient
+@pytest.mark.parametrize("name", ["alpaca_trade_api", "wrds", "yfinance", "compat"])
+def test_no_brokerage_client_or_stub_remains_importable(name):
+    """The RL stack is parked, so FinRL is gone and so are its stubs.
 
-    with pytest.raises(RefusedExternalClient):
-        alpaca_trade_api.REST("key", "secret")
+    compat/ existed only to satisfy FinRL's package root, which imports a live
+    brokerage client. With FinRL out of the tree nothing named after a broker
+    remains in a repository whose central claim is that it cannot trade.
+    See DECISIONS.md 2026-09-08.
+    """
+    import importlib.util
+
+    assert importlib.util.find_spec(name) is None, f"{name} should not be importable"
 
 
 def test_no_graph_node_exposes_an_order_placement_method(settings, dataset):

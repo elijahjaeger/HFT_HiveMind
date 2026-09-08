@@ -7,19 +7,15 @@ pipeline turns into a loss.
 
 from __future__ import annotations
 
-from datetime import timedelta
-
 import pytest
 
 from backtest.skips import SkipReason, skip_summary
-from core.models import Side
 from research.policy import (
     PolicyConfig,
-    assess_edge,
     freshness_window,
     strategy_config_for,
 )
-from tests.conftest import T0, make_quote, make_state
+from tests.conftest import T0
 
 FILLS = {
     "base_slippage": 0.002,
@@ -38,77 +34,7 @@ def policy(**overrides) -> PolicyConfig:
 # -- the cost stack --------------------------------------------------------
 
 
-def test_the_required_edge_is_the_sum_of_every_modelled_cost():
-    state = make_state(quote=make_quote(bid=0.40, ask=0.44, ts=T0), as_of=T0)
-    assessment = assess_edge(state, 0.80, policy(), FILLS)
-    assert assessment.required_edge == pytest.approx(
-        assessment.half_spread + assessment.fee
-        + assessment.slippage + assessment.safety_margin
-    )
-    assert assessment.net_edge == pytest.approx(
-        assessment.raw_edge - assessment.required_edge
-    )
-
-
-def test_a_confident_forecast_above_the_ask_wants_to_buy():
-    state = make_state(quote=make_quote(bid=0.40, ask=0.44, ts=T0), as_of=T0)
-    assessment = assess_edge(state, 0.85, policy(), FILLS)
-    assert assessment.side is Side.BUY
-    assert assessment.is_tradable is True
-
-
-def test_a_confident_forecast_below_the_bid_wants_to_sell():
-    state = make_state(quote=make_quote(bid=0.60, ask=0.64, ts=T0), as_of=T0)
-    assessment = assess_edge(state, 0.10, policy(), FILLS)
-    assert assessment.side is Side.SELL
-    assert assessment.is_tradable is True
-
-
-def test_agreeing_with_the_market_is_not_tradable():
-    quote = make_quote(bid=0.40, ask=0.44, ts=T0)
-    state = make_state(quote=quote, as_of=T0)
-    assessment = assess_edge(state, quote.mid, policy(), FILLS)
-    assert assessment.is_tradable is False
-    assert assessment.net_edge < 0
-
-
-def test_a_thin_edge_is_eaten_by_the_cost_stack():
-    """The half-spread alone is 0.02 here, before fees, slippage or margin."""
-    state = make_state(quote=make_quote(bid=0.40, ask=0.44, ts=T0), as_of=T0)
-    assessment = assess_edge(state, 0.45, policy(), FILLS)
-    assert assessment.raw_edge > 0
-    assert assessment.is_tradable is False
-
-
-def test_a_larger_safety_margin_makes_fewer_trades_tradable():
-    state = make_state(quote=make_quote(bid=0.40, ask=0.44, ts=T0), as_of=T0)
-    lenient = assess_edge(state, 0.55, policy(safety_margin=0.0), FILLS)
-    strict = assess_edge(state, 0.55, policy(safety_margin=0.20), FILLS)
-    assert strict.required_edge > lenient.required_edge
-    assert strict.net_edge < lenient.net_edge
-
-
-def test_the_cost_stack_renders_for_the_dashboard():
-    state = make_state(quote=make_quote(bid=0.40, ask=0.44, ts=T0), as_of=T0)
-    rows = assess_edge(state, 0.85, policy(), FILLS).as_rows()
-    components = {r["component"] for r in rows}
-    assert {"Market probability", "Model probability", "Raw edge"} <= components
-    assert any("fee" in c for c in components)
-    assert any("spread" in c for c in components)
-
-
 # -- declining safely ------------------------------------------------------
-
-
-def test_no_quote_yields_no_assessment_at_all():
-    """There is nothing to assess without a book, so ``None`` is returned."""
-    assert assess_edge(make_state(quote=None, as_of=T0), 0.9, policy(), FILLS) is None
-
-
-def test_a_one_sided_book_yields_no_assessment():
-    """Half a book cannot price the cost of crossing it."""
-    state = make_state(quote=make_quote(bid=0.40, ask=None, ts=T0), as_of=T0)
-    assert assess_edge(state, 0.99, policy(), FILLS) is None
 
 
 def test_the_freshness_window_scales_with_the_decision_grid():
@@ -171,66 +97,34 @@ def forecast_for(market_id: str, ts, probability: float):
     )
 
 
-def test_stale_data_produces_a_no_trade_not_a_trade():
-    """A quote past the freshness window must never be crossed."""
-    from research.policy import ModelForecastAgent, evaluate_policy
-
-    stale_state = make_state(
-        quote=make_quote(bid=0.40, ask=0.44, ts=T0),
-        as_of=T0 + timedelta(seconds=7200),
-    )
-    agent = ModelForecastAgent([forecast_for("M1", stale_state.as_of, 0.95)])
-    run = evaluate_policy(agent, [stale_state], policy(max_quote_age_seconds=900.0), FILLS)
-    assert run.decisions
-    assert all(d.skip is not None for d in run.decisions)
-    assert any(d.skip.reason is SkipReason.STALE_DATA for d in run.decisions)
 
 
-def test_a_missing_forecast_produces_a_no_trade():
-    from research.policy import ModelForecastAgent, evaluate_policy
+def test_there_is_only_one_implementation_of_the_threshold_rule():
+    """Regression guard against reintroducing the parallel policy engine.
 
-    state = make_state(quote=make_quote(bid=0.40, ask=0.44, ts=T0), as_of=T0)
-    agent = ModelForecastAgent([])  # nothing forecast for this market
-    run = evaluate_policy(agent, [state], policy(), FILLS)
-    assert all(d.skip is not None for d in run.decisions)
-    assert any(d.skip.reason is SkipReason.MISSING_FORECAST for d in run.decisions)
+    research/policy.py used to carry a second implementation of "edge must beat
+    the cost stack" - assess_edge/evaluate_policy - reachable only from its own
+    unit tests. It measured edge against the midpoint while the shipped path
+    (agents.strategy.build_proposal, configured by strategy_config_for)
+    measures it against the crossing price, so the two disagreed about which
+    trades existed. Removed 2026-09-08; see DECISIONS.md.
+    """
+    from research import policy as module
 
-
-def test_an_insufficient_edge_is_recorded_with_its_reason():
-    from research.policy import ModelForecastAgent, evaluate_policy
-
-    quote = make_quote(bid=0.40, ask=0.44, ts=T0)
-    state = make_state(quote=quote, as_of=T0)
-    agent = ModelForecastAgent([forecast_for("M1", T0, quote.mid)])
-    run = evaluate_policy(agent, [state], policy(), FILLS)
-    reasons = {d.skip.reason for d in run.decisions if d.skip}
-    assert SkipReason.INSUFFICIENT_EDGE in reasons
-
-
-def test_a_tradable_forecast_is_not_skipped():
-    from research.policy import ModelForecastAgent, evaluate_policy
-
-    state = make_state(quote=make_quote(bid=0.40, ask=0.44, ts=T0), as_of=T0)
-    agent = ModelForecastAgent([forecast_for("M1", T0, 0.95)])
-    run = evaluate_policy(agent, [state], policy(), FILLS)
-    assert any(d.skip is None and d.assessment and d.assessment.is_tradable
-               for d in run.decisions)
+    for name in ("assess_edge", "evaluate_policy", "EdgeAssessment",
+                 "PolicyRun", "PolicyDecision"):
+        assert not hasattr(module, name), (
+            f"{name} is back. The threshold rule has one implementation: "
+            "strategy_config_for feeding agents.strategy.build_proposal."
+        )
 
 
-def test_every_decision_is_accounted_for_either_way():
-    """No decision may vanish: it is a trade candidate or a recorded skip."""
-    from research.policy import ModelForecastAgent, evaluate_policy
+def test_the_pipeline_uses_the_shared_freshness_window():
+    """The constant was defined here and inlined in the pipeline separately."""
+    import inspect
 
-    states = [
-        make_state(quote=make_quote(bid=0.40, ask=0.44, ts=T0), as_of=T0),
-        make_state(quote=None, as_of=T0),
-        make_state(quote=make_quote(bid=0.40, ask=0.44, ts=T0),
-                   as_of=T0 + timedelta(seconds=9000)),
-    ]
-    agent = ModelForecastAgent([forecast_for("M1", s.as_of, 0.95) for s in states])
-    run = evaluate_policy(agent, states, policy(), FILLS)
-    assert len(run.decisions) == len(states)
-    for decision in run.decisions:
-        assert (decision.skip is not None) != (
-            decision.assessment is not None and decision.assessment.is_tradable
-        ) or decision.skip is not None
+    from research import pipeline
+
+    source = inspect.getsource(pipeline.run_model_backtest)
+    assert "freshness_window(" in source
+    assert "stride * 1.5" not in source, "the inlined duplicate is back"
