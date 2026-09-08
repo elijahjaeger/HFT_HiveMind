@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
@@ -31,6 +31,7 @@ from agents.risk import RiskAgent
 from agents.strategy import build_proposal, explain_no_proposal
 from backtest.fills import simulate_fill
 from backtest.skips import SkippedDecision, SkipReason
+from core.jobs import ProgressThrottle
 from core.models import (
     AuditEvent,
     EventKind,
@@ -51,6 +52,14 @@ from core.models import (
     Trade,
     TradeProposal,
 )
+
+PROGRESS_INTERVAL_SECONDS = 0.1
+"""Cap live progress at roughly ten updates a second.
+
+Throttled on time rather than on an event count because event costs are
+wildly uneven: one CLOCK tick fans a decision out across every market, while
+a QUOTE is almost free. A flat every-N-events cadence would emit in bursts.
+"""
 
 QUOTE_PRIORITY, TRADE_PRIORITY, RESOLUTION_PRIORITY, CLOCK_PRIORITY = 0, 1, 2, 3
 
@@ -269,6 +278,37 @@ class Portfolio:
         )
 
 
+@dataclass(frozen=True)
+class BacktestProgress:
+    """A snapshot of a run in flight, safe to hand to another thread.
+
+    Every field is either a plain scalar copied at emission time or a reference
+    to an append-only object that is never mutated after it is created. The
+    live ``Portfolio`` and its ``Position`` objects are never shared:
+    ``positions_view`` is copied out as tuples.
+    """
+
+    ts: datetime
+    index: int
+    n_events: int
+    open_positions: int = 0
+    positions_view: tuple[tuple[str, str, float, float], ...] = ()
+    """``(market_id, side, quantity, avg_price)`` per open position."""
+
+    last_snapshot: PortfolioSnapshot | None = None
+    last_audit: AuditEvent | None = None
+
+    @property
+    def fraction(self) -> float:
+        """Completion in ``[0, 1]``."""
+        return 0.0 if self.n_events <= 0 else min(1.0, (self.index + 1) / self.n_events)
+
+    @property
+    def percent(self) -> int:
+        """Completion as a whole percentage."""
+        return int(round(100 * self.fraction))
+
+
 @dataclass
 class BacktestResult:
     """Everything the simulator produced, ready for metrics and the dashboard."""
@@ -290,6 +330,13 @@ class BacktestResult:
     n_events: int = 0
     metrics: dict[str, Any] = field(default_factory=dict)
     calibration: list[dict[str, Any]] = field(default_factory=list)
+    cancelled: bool = False
+    """True when the run was stopped early and holds only a prefix of the stream.
+
+    A cancelled result is a fully-formed :class:`BacktestResult`, just built
+    from fewer events. It must be labelled as partial wherever it is shown, so
+    a truncated run is never mistaken for a complete one.
+    """
 
     @property
     def executed_fills(self) -> list[SimulatedFill]:
@@ -413,6 +460,9 @@ class BacktestEngine:
         markets: Sequence[Market],
         quotes: Sequence[Quote],
         trades: Sequence[Trade],
+        *,
+        on_progress: Callable[[BacktestProgress], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> BacktestResult:
         """Replay the dataset chronologically and return the full result set.
 
@@ -421,6 +471,14 @@ class BacktestEngine:
                 settlement and post-hoc scoring).
             quotes: Book snapshots.
             trades: Public tape prints.
+            on_progress: Called with a :class:`BacktestProgress` at most every
+                ``PROGRESS_INTERVAL_SECONDS``, and always once for the final
+                event. Both new hooks are keyword-only and default to ``None``,
+                so every existing call site is byte-for-bit unaffected.
+            should_stop: Checked once per event. When it returns True the loop
+                breaks and the result is returned with ``cancelled=True``,
+                holding only the events processed so far. This is
+                cancel-and-discard, not pause/resume.
 
         Returns:
             A populated :class:`BacktestResult`.
@@ -444,8 +502,10 @@ class BacktestEngine:
 
         events = build_event_stream(quotes, trades, markets, self.decision_interval)
         result.n_events = len(events)
+        throttle = ProgressThrottle(PROGRESS_INTERVAL_SECONDS)
+        last_index = len(events) - 1
 
-        for event in events:
+        for index, event in enumerate(events):
             if previous_ts is not None and event.ts < previous_ts:
                 raise ValueError(
                     f"event stream is not chronological: {event.ts} after {previous_ts}"
@@ -495,6 +555,33 @@ class BacktestEngine:
 
             if self.record_every_event or event.kind == "RESOLUTION":
                 result.snapshots.append(portfolio.snapshot(event.ts, marks))
+
+            # Progress is emitted before the cancellation check so a stopped run
+            # still reports the point it reached.
+            if on_progress is not None and throttle.should_emit(force=index == last_index):
+                on_progress(
+                    BacktestProgress(
+                        ts=event.ts,
+                        index=index,
+                        n_events=result.n_events,
+                        open_positions=len(portfolio.positions),
+                        positions_view=tuple(
+                            (
+                                market_id,
+                                "LONG" if position.quantity >= 0 else "SHORT",
+                                position.quantity,
+                                position.avg_price,
+                            )
+                            for market_id, position in portfolio.positions.items()
+                        ),
+                        last_snapshot=result.snapshots[-1] if result.snapshots else None,
+                        last_audit=result.audit_log[-1] if result.audit_log else None,
+                    )
+                )
+
+            if should_stop is not None and should_stop():
+                result.cancelled = True
+                break
 
         result.final_equity = portfolio.equity(marks)
         return result
@@ -879,6 +966,9 @@ def run_backtest(
     liquidity_agent: LiquidityAgent | None = None,
     risk_agent: RiskAgent | None = None,
     with_metrics: bool = True,
+    *,
+    on_progress: Callable[[BacktestProgress], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> BacktestResult:
     """Convenience wrapper: build an engine, run it and attach metrics.
 
@@ -887,6 +977,10 @@ def run_backtest(
         quotes: Book snapshots.
         trades: Public tape prints.
         settings: Full settings dictionary.
+        on_progress: Optional live-progress callback, forwarded to the engine.
+        should_stop: Optional cancellation predicate, forwarded to the engine.
+            A cancelled run still returns a valid result, holding only the
+            events processed before the stop, with ``cancelled=True``.
         forecast_agents: Override the default forecast agents.
         liquidity_agent: Override the default liquidity agent.
         risk_agent: Override the default risk agent.
@@ -896,7 +990,9 @@ def run_backtest(
         A populated :class:`BacktestResult`.
     """
     engine = BacktestEngine(settings, forecast_agents, liquidity_agent, risk_agent)
-    result = engine.run(markets, quotes, trades)
+    result = engine.run(
+        markets, quotes, trades, on_progress=on_progress, should_stop=should_stop
+    )
     if with_metrics:
         from backtest.metrics import compute_metrics
 

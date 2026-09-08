@@ -294,3 +294,122 @@ def test_the_backtest_is_reproducible(dataset, module_settings):
     first = run_backtest(dataset.markets, dataset.quotes, dataset.trades, module_settings)
     second = run_backtest(dataset.markets, dataset.quotes, dataset.trades, module_settings)
     assert first.metrics == second.metrics
+
+
+# --------------------------------------------------------------------------
+# Live progress and cancellation
+#
+# The invariant that matters most: with neither hook passed, the run is
+# byte-for-bit what it was before these existed.
+# --------------------------------------------------------------------------
+
+
+def test_the_untouched_path_is_unaffected_by_the_new_hooks(dataset, module_settings):
+    """Both hooks default to None and every new branch is guarded on that."""
+    plain = run_backtest(dataset.markets, dataset.quotes, dataset.trades, module_settings)
+    watched = run_backtest(
+        dataset.markets, dataset.quotes, dataset.trades, module_settings,
+        on_progress=lambda p: None,
+    )
+    assert plain.metrics == watched.metrics
+    assert plain.cancelled is False
+    assert len(plain.fills) == len(watched.fills)
+
+
+def test_progress_reaches_one_hundred_percent_on_the_final_event(
+    dataset, module_settings
+):
+    seen: list = []
+    result = run_backtest(
+        dataset.markets, dataset.quotes, dataset.trades, module_settings,
+        on_progress=seen.append,
+    )
+    assert seen, "at least one progress update is required"
+    assert seen[-1].index == result.n_events - 1
+    assert seen[-1].percent == 100
+
+
+def test_progress_is_throttled_rather_than_emitted_per_event(dataset, module_settings):
+    """A UI cannot repaint thousands of times a second and should not be asked to."""
+    seen: list = []
+    result = run_backtest(
+        dataset.markets, dataset.quotes, dataset.trades, module_settings,
+        on_progress=seen.append,
+    )
+    assert result.n_events > 100, "fixture too small to prove throttling"
+    assert len(seen) < result.n_events / 10, (
+        f"{len(seen)} updates for {result.n_events} events is not throttled"
+    )
+
+
+def test_a_progress_payload_matches_the_state_actually_recorded(
+    dataset, module_settings
+):
+    seen: list = []
+    result = run_backtest(
+        dataset.markets, dataset.quotes, dataset.trades, module_settings,
+        on_progress=seen.append,
+    )
+    final = seen[-1]
+    assert final.last_snapshot is not None
+    assert final.last_snapshot.ts == result.snapshots[-1].ts
+    assert final.last_snapshot.equity == result.snapshots[-1].equity
+    assert final.open_positions == len(final.positions_view)
+
+
+def test_positions_view_is_copied_out_not_shared(dataset, module_settings):
+    """Nothing mutable may cross a thread boundary."""
+    seen: list = []
+    run_backtest(
+        dataset.markets, dataset.quotes, dataset.trades, module_settings,
+        on_progress=seen.append,
+    )
+    for update in seen:
+        assert isinstance(update.positions_view, tuple)
+        for row in update.positions_view:
+            assert isinstance(row, tuple) and len(row) == 4
+            assert row[1] in {"LONG", "SHORT"}
+
+
+def test_should_stop_halts_the_run_and_marks_it_partial(dataset, module_settings):
+    calls = {"n": 0}
+
+    def stop_after_fifty() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 50
+
+    full = run_backtest(dataset.markets, dataset.quotes, dataset.trades, module_settings)
+    stopped = run_backtest(
+        dataset.markets, dataset.quotes, dataset.trades, module_settings,
+        should_stop=stop_after_fifty,
+    )
+    assert stopped.cancelled is True
+    assert full.cancelled is False
+    assert len(stopped.snapshots) < len(full.snapshots)
+    assert stopped.n_events == full.n_events, "n_events is the stream size, not progress"
+
+
+def test_a_cancelled_result_is_still_a_well_formed_result(dataset, module_settings):
+    """Partial, not broken: the same shape, built from fewer events."""
+    stopped = run_backtest(
+        dataset.markets, dataset.quotes, dataset.trades, module_settings,
+        should_stop=lambda: True,
+    )
+    assert stopped.cancelled is True
+    assert stopped.markets, "markets are recorded before the loop runs"
+    assert stopped.final_equity > 0.0, "equity is still marked after an early break"
+    assert isinstance(stopped.metrics, dict)
+
+
+def test_a_cancellation_token_can_be_passed_directly_as_should_stop(
+    dataset, module_settings
+):
+    from core.jobs import CancellationToken
+
+    token = CancellationToken()
+    token.cancel()
+    result = run_backtest(
+        dataset.markets, dataset.quotes, dataset.trades, module_settings,
+        should_stop=token,
+    )
+    assert result.cancelled is True

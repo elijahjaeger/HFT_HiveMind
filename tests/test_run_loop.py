@@ -228,11 +228,7 @@ def test_a_transient_discovery_failure_is_retried_not_reported_as_no_data(
     monkeypatch.setattr(module, "discover_settled_markets", flaky)
     monkeypatch.setattr(
         module, "fetch_corpus_chunked",
-        lambda a, t, s2, e, c=None, errors=None, markets=None: MarketDataset(
-            markets=[m for m in small_corpus.markets if m.market_id in set(t)],
-            quotes=[q for q in small_corpus.quotes if q.market_id in set(t)],
-            trades=[], seed=None, label="KALSHI HISTORICAL", source="KALSHI_CANDLES",
-        ),
+        _slice_fetch(small_corpus),
     )
     config = LoopConfig(cache_path=str(tmp_path / "c.duckdb"), max_iterations=3)
     result = run_loop(small_settings, config, adapter=StubAdapter([], small_corpus))
@@ -565,6 +561,28 @@ class StubAdapter:
         return batch
 
 
+def _slice_fetch(corpus: MarketDataset):
+    """A fetch_corpus_chunked stand-in that slices a corpus, offline.
+
+    Mirrors the real signature including ``should_stop`` so a signature change
+    surfaces here rather than as a confusing NO_DATA at run time.
+    """
+
+    def fetch(adapter, tickers, start, end, config=None, errors=None,
+              markets=None, should_stop=None):
+        ids = set(tickers)
+        return MarketDataset(
+            markets=[m for m in corpus.markets if m.market_id in ids],
+            quotes=[q for q in corpus.quotes if q.market_id in ids],
+            trades=[],
+            seed=None,
+            label="KALSHI HISTORICAL",
+            source="KALSHI_CANDLES",
+        )
+
+    return fetch
+
+
 def _patch_loop(monkeypatch, stub: StubAdapter, ids_per_batch: list[list[str]]):
     """Wire discovery/fetch to the stub so the loop runs with no network."""
     import research.run_loop as module
@@ -579,7 +597,10 @@ def _patch_loop(monkeypatch, stub: StubAdapter, ids_per_batch: list[list[str]]):
             for t in batch
         ]
 
-    def fetch(adapter, tickers, start, end, config=None, errors=None, markets=None):
+    def fetch(
+        adapter, tickers, start, end, config=None, errors=None, markets=None,
+        should_stop=None,
+    ):
         ids = set(tickers)
         return MarketDataset(
             markets=[m for m in stub.corpus.markets if m.market_id in ids],
@@ -1044,3 +1065,88 @@ def test_a_run_with_no_iterations_still_says_what_went_wrong():
     text = _no_pass_summary(report)
     assert "What went wrong" in text
     assert "failed to fetch" in text
+
+
+# ==========================================================================
+# Cancellation - a stopped run is shorter, not invalid
+# ==========================================================================
+
+
+def test_a_cancelled_loop_stops_with_its_own_reason(
+    monkeypatch, small_corpus, small_settings, tmp_path
+):
+    ids = [m.market_id for m in small_corpus.markets]
+    stub = StubAdapter([], small_corpus)
+    _patch_loop(monkeypatch, stub, [ids[:10], ids[10:20], ids[20:]])
+    config = LoopConfig(cache_path=str(tmp_path / "c.duckdb"), max_iterations=3)
+
+    result = run_loop(small_settings, config, adapter=stub, should_stop=lambda: True)
+    assert result.stopped_because is StopReason.CANCELLED
+    assert result.iterations == [], "cancelled before the first iteration ran"
+
+
+def test_iterations_completed_before_a_stop_are_kept(
+    monkeypatch, small_corpus, small_settings, tmp_path
+):
+    """Stopping must not throw away work already done and already recorded."""
+    ids = [m.market_id for m in small_corpus.markets]
+    stub = StubAdapter([], small_corpus)
+    _patch_loop(monkeypatch, stub, [ids[:10], ids[10:20], ids[20:]])
+    config = LoopConfig(cache_path=str(tmp_path / "c.duckdb"), max_iterations=3)
+
+    seen: list = []
+
+    def stop_after_one() -> bool:
+        return len(seen) >= 1
+
+    result = run_loop(
+        small_settings, config, adapter=stub,
+        on_iteration=seen.append, should_stop=stop_after_one,
+    )
+    assert result.stopped_because is StopReason.CANCELLED
+    assert len(result.iterations) == 1
+    assert result.iterations[0].corpus_markets > 0
+
+
+def test_a_cancellation_token_drives_the_loop(
+    monkeypatch, small_corpus, small_settings, tmp_path
+):
+    from core.jobs import CancellationToken
+
+    ids = [m.market_id for m in small_corpus.markets]
+    stub = StubAdapter([], small_corpus)
+    _patch_loop(monkeypatch, stub, [ids[:10]])
+    token = CancellationToken()
+    token.cancel()
+
+    result = run_loop(
+        small_settings,
+        LoopConfig(cache_path=str(tmp_path / "c.duckdb"), max_iterations=2),
+        adapter=stub,
+        should_stop=token,
+    )
+    assert result.stopped_because is StopReason.CANCELLED
+
+
+def test_the_chunked_fetch_stops_between_chunks():
+    """A chunk is one request batch, which bounds how long a stop takes."""
+    base = generate_demo_dataset({"n_markets": 4, "n_steps": 40})
+    calls: list[int] = []
+
+    class Counting:
+        def fetch_dataset(self, spec):
+            calls.append(len(spec.tickers))
+            ids = set(spec.tickers)
+            return MarketDataset(
+                markets=[m for m in base.markets if m.market_id in ids],
+                quotes=[], trades=[], seed=None,
+                label="KALSHI HISTORICAL", source="KALSHI_CANDLES",
+            )
+
+    fetch_corpus_chunked(
+        Counting(), ["DEMO-01", "DEMO-02", "DEMO-03", "DEMO-04"],
+        CUTOFF - timedelta(days=1), CUTOFF,
+        LoopConfig(fetch_chunk_size=1, historical_first=False),
+        None, None, lambda: True,
+    )
+    assert calls == [], "a stop before the first chunk fetches nothing"

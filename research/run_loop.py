@@ -38,6 +38,7 @@ else and writes only to an in-memory portfolio and the local registry.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -91,6 +92,9 @@ class StopReason(StrEnum):
 
     DISCOVERY_FAILED = "DISCOVERY_FAILED"
     """Discovery kept failing. A venue problem, not a finding about the data."""
+
+    CANCELLED = "CANCELLED"
+    """A human stopped the run. Iterations already completed are still valid."""
 
 
 @dataclass(frozen=True)
@@ -455,6 +459,7 @@ def fetch_corpus_chunked(
     config: LoopConfig | None = None,
     errors: list[str] | None = None,
     markets: list[DiscoveredMarket] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> MarketDataset | None:
     """Fetch ``tickers`` in chunks, keeping whatever succeeds.
 
@@ -469,6 +474,10 @@ def fetch_corpus_chunked(
     spans = {m.ticker: (m.opened, m.closed) for m in (markets or ())}
 
     for index in range(0, len(tickers), size):
+        # Between chunks is the natural place to stop: a chunk is one
+        # request batch, so this bounds how long a stop takes to land.
+        if should_stop is not None and should_stop():
+            break
         chunk = tickers[index : index + size]
         # Bound the request to what this chunk actually spans. Using the whole
         # discovery window implies far more candles than the venue will return
@@ -655,6 +664,7 @@ def run_loop(
     adapter: KalshiAdapter | None = None,
     registry: ResearchRegistry | None = None,
     on_iteration: Any = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> LoopReport:
     """Grow a real corpus until the gate passes, data runs out, or growth stops.
 
@@ -665,6 +675,10 @@ def run_loop(
         registry: Where runs are recorded.
         on_iteration: Optional callback invoked with each
             :class:`IterationReport` as it completes, for progress reporting.
+        should_stop: Optional cancellation predicate, checked between
+            iterations and between fetch chunks. Iterations already completed
+            keep their results and their registry rows - a stopped run is
+            shorter, not invalid.
 
     Returns:
         A :class:`LoopReport`. A passing gate yields a recommendation for a
@@ -683,6 +697,9 @@ def run_loop(
     notes: list[str] = []
 
     for iteration in range(1, cfg.max_iterations + 1):
+        if should_stop is not None and should_stop():
+            result.stopped_because = StopReason.CANCELLED
+            break
         window = window_for(cutoff, iteration, cfg)
         discovery_errors: list[str] = []
         discovered = discover_settled_markets(
@@ -710,7 +727,8 @@ def run_loop(
 
         fetch_errors: list[str] = []
         fetched = fetch_corpus_chunked(
-            kalshi, tickers, window[0], window[1], cfg, fetch_errors, discovered
+            kalshi, tickers, window[0], window[1], cfg, fetch_errors, discovered,
+            should_stop,
         )
         notes.extend(fetch_errors)
         corpus = merge_corpora(corpus, fetched)

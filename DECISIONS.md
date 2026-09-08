@@ -66,6 +66,65 @@ nothing to diff against. This file closes that gap.
 
 ---
 
+## 2026-09-08 - Job layer: live progress and cancellation
+
+**Status:** adopted.
+
+"The app is the product" was false while the longest job in the project - the
+corpus loop, minutes of throttled venue requests plus a walk-forward pass per
+iteration - was reachable only from a CLI, and while a backtest gave no sign of
+life until it finished.
+
+### What was built
+
+`core/jobs.py` holds the Qt-free primitives: `CancellationToken` (callable, so
+it *is* a `should_stop` predicate), `JobProgress` and `ProgressThrottle`. The
+application layer decides where a job runs; this module only defines how it
+reports and how it is asked to stop.
+
+`BacktestEngine.run` and `run_backtest` gained keyword-only `on_progress` and
+`should_stop`, following `docs/design/live-backtest-progress-and-stop.md`.
+`BacktestResult` gained `cancelled`. `research.run_loop.run_loop` gained
+`should_stop`, checked between iterations and between fetch chunks, with a new
+`StopReason.CANCELLED`.
+
+The Backtest tab has a determinate progress bar, live timestamp/position/audit
+labels and a Stop button. A new **Corpus** tab drives the research loop from the
+UI, appending each iteration as it lands.
+
+### Two decisions worth recording
+
+**The job layer does not supersede the LangGraph supervisor, and the supervisor
+does not become the job layer.** They answer different questions - "what
+analysis steps run for one instant" versus "how does a ten-minute task report
+and stop". `src/state_graph.py` stays as a callable a job could run. Whether it
+earns its place at all is still open.
+
+**Progress is throttled on time, not on an event count.** Event costs are wildly
+uneven: one CLOCK tick fans a decision across every market while a QUOTE is
+nearly free, so an every-N-events cadence emits in bursts. Measured: 3 updates
+over 1,567 events.
+
+### What cancelling means
+
+Cancel-and-discard, not pause/resume. A stopped backtest returns a fully-formed
+`BacktestResult` built from fewer events, and the UI labels it partial so a
+truncated run is never mistaken for a complete one. A stopped corpus loop keeps
+every completed iteration and its registry rows. Nothing live is touched by
+either - the only thing interrupted is a loop replaying stored events.
+
+### A bug the tests caught
+
+`ProgressThrottle` initialised its clock to `0.0`, so the *first* update was
+suppressed whenever the injected clock read lower than the interval. Hidden in
+production only because `time.monotonic()` returns a large number. Now `None`
+means "never emitted" and the first call always passes.
+
+Verification: 704 passed, 4 skipped, exit 0. ruff clean. verify_architecture
+exit 0.
+
+---
+
 ## 2026-09-08 - Mission and architecture fixed; direction set
 
 **Status:** adopted.
@@ -354,7 +413,7 @@ entries above are not.
 | Mission and architecture | **Fixed 2026-09-08.** See the Mission section at the top. | - |
 | Audit debt | **Cleared.** Dead `evaluate_policy` engine removed (policy.py 417 -> 182 lines), `freshness_window` wired in, stale `corpus.py`/README concurrency claims corrected, Streamlit reference gone. | - |
 | RL stack | **Parked and uninstalled.** `src/rl_policy.py` imports optionally; `compat/` and the three root broker stubs deleted. 4 tests skip. | Unpark only with a validated forecast edge and enough independent outcomes. |
-| Job layer / app-as-product | **Not started. Next slice.** | Progress + cancellation for backtests, then the corpus loop driven and stoppable from the UI. A design already exists at `docs/design/live-backtest-progress-and-stop.md`. |
+| Job layer / app-as-product | **Done.** `core/jobs.py`; backtest and corpus loop both report progress and stop from the UI. New Corpus tab. | Extend to the Research tab's four stages, which still block without feedback. |
 | Manifold adapter | Not started. | Unblocks walk-forward with a corpus whose lifetimes actually fit the protocol. |
 | Polymarket adapter | Not started. | Real money, real book depth; addresses the 83% one-sided-book row loss. |
 | Research desk integration | `ResearchDeskAgent` exists behind `analyze()` but is not graded by walk-forward or visible in the app. | Wire into the harness so the personas are measured rather than asserted. |

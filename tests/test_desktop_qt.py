@@ -125,7 +125,19 @@ def test_the_main_window_builds_and_loads_demo_data(qt_app):
 
         assert window.dataset is not None, "demo data never loaded"
         assert window.dataset.is_demo
-        assert window.tabs.count() == 8
+        # Asserted by name, not by count: adding a tab is not a regression,
+        # losing one is.
+        tabs = {window.tabs.tabText(i) for i in range(window.tabs.count())}
+        assert {
+            "Market explorer",
+            "Corpus",
+            "Backtest",
+            "Calibration",
+            "Research",
+            "Paper mode",
+            "Audit log",
+            "Data source",
+        } <= tabs, f"missing tab(s): {tabs}"
         labels = [w.text() for w in window.findChildren(QLabel)]
         assert any("LIVE TRADING DISABLED" in text for text in labels)
         assert any("DEMO DATA" in text for text in labels)

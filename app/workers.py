@@ -10,6 +10,7 @@ from PySide6.QtCore import QObject, QThread, Signal
 from adapters.kalshi import KalshiAdapter, KalshiFetchSpec
 from backtest.engine import run_backtest
 from core.dataset import MarketDataset
+from core.jobs import CancellationToken
 from core.store import load_or_create_dataset
 
 
@@ -26,15 +27,38 @@ class Worker(QObject):
 
 
 class BacktestWorker(Worker):
-    """Runs one backtest off the UI thread."""
+    """Runs one backtest off the UI thread, reporting progress and stoppable.
+
+    ``progress_update`` is defined here rather than on :class:`Worker` because
+    the demo-data and Kalshi-fetch workers have no analogous concept, and an
+    unused signal on the shared base would loosen its contract.
+    """
+
+    progress_update = Signal(object)
+    """Carries a :class:`backtest.engine.BacktestProgress`."""
 
     def __init__(self, dataset: MarketDataset, settings: dict[str, Any]) -> None:
         super().__init__()
         self.dataset = dataset
         self.settings = settings
+        self._token = CancellationToken()
+
+    def cancel(self) -> None:
+        """Ask the run to stop. Safe to call from the UI thread.
+
+        Setting the flag is the only thing that crosses into the worker thread.
+        The run returns on its own within roughly one event's processing time
+        and ``finished`` fires normally, so teardown is unchanged.
+        """
+        self._token.cancel()
+
+    @property
+    def cancelled(self) -> bool:
+        """Whether a stop has been requested."""
+        return self._token.cancelled
 
     def run(self) -> None:
-        """Replay the dataset and emit the result."""
+        """Replay the dataset and emit the result, partial or complete."""
         try:
             self.progress.emit("Replaying events...")
             result = run_backtest(
@@ -42,6 +66,8 @@ class BacktestWorker(Worker):
                 self.dataset.quotes,
                 self.dataset.trades,
                 self.settings,
+                on_progress=self.progress_update.emit,
+                should_stop=self._token,
             )
             self.finished.emit(result)
         except Exception as error:  # noqa: BLE001 - surfaced in the UI
@@ -85,6 +111,57 @@ class KalshiFetchWorker(Worker):
                 f"Fetched {len(dataset.quotes)} quotes and {len(dataset.trades)} trades."
             )
             self.finished.emit(dataset)
+        except Exception as error:  # noqa: BLE001 - surfaced in the UI
+            self.failed.emit(f"{type(error).__name__}: {error}")
+
+
+class CorpusLoopWorker(Worker):
+    """Runs the corpus-building research loop off the UI thread.
+
+    The loop is the longest job in the application - minutes of throttled venue
+    requests followed by a full walk-forward pass per iteration - so it is the
+    one that most needs to be stoppable. Stopping is safe: iterations already
+    completed keep their results and their registry rows.
+    """
+
+    iteration_done = Signal(object)
+    """Carries a :class:`research.run_loop.IterationReport` as each pass ends."""
+
+    def __init__(self, settings: dict[str, Any], config: Any) -> None:
+        super().__init__()
+        self.settings = settings
+        self.config = config
+        self._token = CancellationToken()
+
+    def cancel(self) -> None:
+        """Ask the loop to stop after the current chunk or iteration."""
+        self._token.cancel()
+
+    @property
+    def cancelled(self) -> bool:
+        """Whether a stop has been requested."""
+        return self._token.cancelled
+
+    def run(self) -> None:
+        """Grow the corpus until the gate passes, data runs out, or stopped."""
+        try:
+            from research.registry import ResearchRegistry
+            from research.run_loop import run_loop
+
+            self.progress.emit("Discovering settled markets (read-only)...")
+            registry = ResearchRegistry(
+                self.settings.get("research", {}).get(
+                    "registry_path", "data/research/registry.duckdb"
+                )
+            )
+            report = run_loop(
+                self.settings,
+                self.config,
+                registry=registry,
+                on_iteration=self.iteration_done.emit,
+                should_stop=self._token,
+            )
+            self.finished.emit(report)
         except Exception as error:  # noqa: BLE001 - surfaced in the UI
             self.failed.emit(f"{type(error).__name__}: {error}")
 

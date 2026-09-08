@@ -62,6 +62,7 @@ from app.qt_charts import (  # noqa: E402
 from app.qt_models import RowTableModel  # noqa: E402
 from app.workers import (  # noqa: E402
     BacktestWorker,
+    CorpusLoopWorker,
     DemoDataWorker,
     KalshiFetchWorker,
     WorkerRunner,
@@ -170,6 +171,9 @@ class MainWindow(QMainWindow):
             )
         )
         self._runner: WorkerRunner | None = None
+        # Held only while a backtest is in flight, so Stop can reach it.
+        self._backtest_worker: BacktestWorker | None = None
+        self._corpus_worker: CorpusLoopWorker | None = None
 
         self.setWindowTitle("HFT Hivemind - prediction-market research sandbox")
         self.resize(1400, 900)
@@ -196,6 +200,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_explorer_tab(), "Market explorer")
         self.tabs.addTab(self._build_decision_tab(), "Agents && risk")
+        self.tabs.addTab(self._build_corpus_tab(), "Corpus")
         self.tabs.addTab(self._build_backtest_tab(), "Backtest")
         self.tabs.addTab(self._build_calibration_tab(), "Calibration")
         self.tabs.addTab(self._build_research_tab(), "Research")
@@ -468,6 +473,139 @@ class MainWindow(QMainWindow):
         layout.addWidget(footer)
         return page
 
+    def _build_corpus_tab(self) -> QWidget:
+        """Build a real research corpus from the read-only venue adapter.
+
+        The longest-running thing the application does, so it is stoppable and
+        reports every iteration as it lands rather than only at the end.
+        """
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        banner = QLabel(
+            "Pulls SETTLED markets through the read-only adapter, grows a cached "
+            "corpus, and runs the full research pipeline over it each iteration. "
+            "Read-only: no order path, no credentials. The promotion gate is "
+            "reported, never loosened."
+        )
+        banner.setWordWrap(True)
+        banner.setStyleSheet("background:#eef4ff; padding:6px; border-radius:4px;")
+        layout.addWidget(banner)
+
+        controls = QHBoxLayout()
+        self.corpus_run_button = QPushButton("Build corpus")
+        self.corpus_run_button.clicked.connect(self.run_corpus_loop)
+        controls.addWidget(self.corpus_run_button)
+        self.corpus_stop_button = QPushButton("Stop")
+        self.corpus_stop_button.setEnabled(False)
+        self.corpus_stop_button.setToolTip(
+            "Stop after the current chunk. Iterations already completed keep "
+            "their results and their registry rows."
+        )
+        self.corpus_stop_button.clicked.connect(self._stop_corpus_loop)
+        controls.addWidget(self.corpus_stop_button)
+
+        controls.addWidget(QLabel("Markets / iteration:"))
+        self.corpus_markets_spin = QSpinBox()
+        self.corpus_markets_spin.setRange(10, 2000)
+        self.corpus_markets_spin.setValue(150)
+        controls.addWidget(self.corpus_markets_spin)
+
+        controls.addWidget(QLabel("Max iterations:"))
+        self.corpus_iterations_spin = QSpinBox()
+        self.corpus_iterations_spin.setRange(1, 50)
+        self.corpus_iterations_spin.setValue(5)
+        controls.addWidget(self.corpus_iterations_spin)
+
+        controls.addWidget(QLabel("Min market life (h):"))
+        self.corpus_lifetime_spin = QDoubleSpinBox()
+        self.corpus_lifetime_spin.setRange(0.0, 720.0)
+        self.corpus_lifetime_spin.setValue(6.0)
+        self.corpus_lifetime_spin.setToolTip(
+            "Markets shorter than the feature horizon yield zero decision "
+            "timestamps and cannot produce a training row."
+        )
+        controls.addWidget(self.corpus_lifetime_spin)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        self.corpus_progress = QProgressBar()
+        self.corpus_progress.setRange(0, 0)  # indeterminate: size is discovered
+        self.corpus_progress.setVisible(False)
+        layout.addWidget(self.corpus_progress)
+
+        self.corpus_status_label = QLabel("Not started.")
+        self.corpus_status_label.setWordWrap(True)
+        layout.addWidget(self.corpus_status_label)
+
+        self.corpus_iterations_model = RowTableModel()
+        layout.addWidget(table_view(self.corpus_iterations_model), 1)
+
+        self.corpus_summary_label = QLabel("")
+        self.corpus_summary_label.setWordWrap(True)
+        self.corpus_summary_label.setStyleSheet("font-family:monospace;")
+        layout.addWidget(self.corpus_summary_label)
+        return page
+
+    def run_corpus_loop(self) -> None:
+        """Start the corpus-building loop against the read-only venue."""
+        from research.run_loop import LoopConfig
+
+        settings = self.collect_settings()
+        config = LoopConfig(
+            max_iterations=self.corpus_iterations_spin.value(),
+            markets_per_iteration=self.corpus_markets_spin.value(),
+            min_lifetime_hours=self.corpus_lifetime_spin.value(),
+        )
+        self.corpus_run_button.setEnabled(False)
+        self.corpus_stop_button.setEnabled(True)
+        self.corpus_progress.setVisible(True)
+        self.corpus_iterations_model.set_rows([])
+        self.corpus_summary_label.setText("")
+        self.corpus_status_label.setText("Discovering settled markets...")
+
+        worker = CorpusLoopWorker(settings, config)
+        self._corpus_worker = worker
+        worker.iteration_done.connect(self._on_corpus_iteration)
+        self._start(worker, self._on_corpus_finished)
+
+    def _on_corpus_iteration(self, report: Any) -> None:
+        """Append one completed iteration as it lands."""
+        rows = list(self.corpus_iterations_model.rows) + [report.as_row()]
+        self.corpus_iterations_model.set_rows(rows)
+        self.corpus_status_label.setText(
+            f"Iteration {report.iteration}: corpus {report.corpus_markets:,} market(s), "
+            f"{report.corpus_effective_n} resolved, {report.rows_labelled:,} labelled "
+            f"row(s) - out-of-sample {report.effective_n} across {report.fold_count} "
+            f"usable fold(s). Gate: "
+            + ("PASSED" if report.gate_passed else "failed")
+        )
+
+    def _stop_corpus_loop(self) -> None:
+        """Ask the loop to stop. Completed iterations are kept."""
+        if self._corpus_worker is None:
+            return
+        self._corpus_worker.cancel()
+        self.corpus_stop_button.setEnabled(False)
+        self.corpus_status_label.setText("Stopping after the current chunk...")
+
+    def _on_corpus_finished(self, report: Any) -> None:
+        """Render the final verdict, passed or not."""
+        self.progress.setVisible(False)
+        self.corpus_run_button.setEnabled(True)
+        self.corpus_stop_button.setEnabled(False)
+        self.corpus_progress.setVisible(False)
+        self._corpus_worker = None
+        self.corpus_status_label.setText(f"Stopped: {report.stopped_because.value}")
+        self.corpus_summary_label.setText(report.recommendation)
+        if report.gate_passed:
+            QMessageBox.information(
+                self,
+                "Promotion gate passed",
+                report.recommendation
+                + "\n\nThis is a candidate for review, not an approval.",
+            )
+
     def _build_backtest_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -476,6 +614,14 @@ class MainWindow(QMainWindow):
         self.run_button = QPushButton("Run backtest")
         self.run_button.clicked.connect(self.run_backtest)
         controls.addWidget(self.run_button)
+        self.backtest_stop_button = QPushButton("Stop")
+        self.backtest_stop_button.setEnabled(False)
+        self.backtest_stop_button.setToolTip(
+            "Stop replaying events. Results so far are kept and clearly labelled "
+            "partial. Nothing live is affected - this is a simulation."
+        )
+        self.backtest_stop_button.clicked.connect(self._stop_backtest)
+        controls.addWidget(self.backtest_stop_button)
         note = QLabel(
             "Replays the loaded data chronologically through the agent stack. Results "
             "describe one simulation - not evidence of profitability."
@@ -484,6 +630,21 @@ class MainWindow(QMainWindow):
         note.setWordWrap(True)
         controls.addWidget(note, 1)
         layout.addLayout(controls)
+
+        # Determinate bar, distinct from the window-level marquee used by the
+        # data-loading flows.
+        self.backtest_progress = QProgressBar()
+        self.backtest_progress.setRange(0, 100)
+        self.backtest_progress.setValue(0)
+        self.backtest_progress.setVisible(False)
+        layout.addWidget(self.backtest_progress)
+
+        self.backtest_live_label = QLabel("")
+        self.backtest_live_label.setStyleSheet("color:#57606a;")
+        layout.addWidget(self.backtest_live_label)
+        self.backtest_audit_label = QLabel("")
+        self.backtest_audit_label.setStyleSheet("color:#57606a; font-family:monospace;")
+        layout.addWidget(self.backtest_audit_label)
 
         self.metric_row = QHBoxLayout()
         layout.addLayout(self.metric_row)
@@ -1381,7 +1542,51 @@ class MainWindow(QMainWindow):
             return
         settings = self.collect_settings()
         self.run_button.setEnabled(False)
-        self._start(BacktestWorker(self.dataset, settings), self._on_result_ready)
+        self.backtest_stop_button.setEnabled(True)
+        self.backtest_progress.setValue(0)
+        self.backtest_progress.setVisible(True)
+        self.backtest_live_label.setText("Starting...")
+        self.backtest_audit_label.setText("")
+
+        worker = BacktestWorker(self.dataset, settings)
+        # Held so Stop can reach it; cleared when the run ends either way.
+        self._backtest_worker = worker
+        worker.progress_update.connect(self._on_backtest_progress)
+        self._start(worker, self._on_result_ready)
+
+    def _on_backtest_progress(self, update: Any) -> None:
+        """Render one throttled progress update. Never touches the tables."""
+        self.backtest_progress.setValue(update.percent)
+        positions = ", ".join(
+            f"{market} {side} {quantity:+.0f} @ {price:.3f}"
+            for market, side, quantity, price in update.positions_view[:4]
+        )
+        self.backtest_live_label.setText(
+            f"t={update.ts:%Y-%m-%d %H:%M:%S} UTC  ·  event "
+            f"{update.index + 1:,}/{update.n_events:,}  ·  "
+            f"{update.open_positions} open position(s)"
+            + (f"  ·  {positions}" if positions else "")
+        )
+        if update.last_audit is not None:
+            self.backtest_audit_label.setText(
+                f"{update.last_audit.kind.value}: {update.last_audit.message}"
+            )
+
+    def _stop_backtest(self) -> None:
+        """Ask the running backtest to stop. Simulation only - nothing live."""
+        if self._backtest_worker is None:
+            return
+        self._backtest_worker.cancel()
+        self.backtest_stop_button.setEnabled(False)
+        self.backtest_live_label.setText("Stopping after the current event...")
+
+    def _finish_backtest_ui(self) -> None:
+        """Reset the run controls however the run ended."""
+        self.run_button.setEnabled(True)
+        self.backtest_stop_button.setEnabled(False)
+        self.backtest_progress.setVisible(False)
+        self.backtest_progress.setValue(0)
+        self._backtest_worker = None
 
     def _start(self, worker, on_finished) -> None:
         self.progress.setVisible(True)
@@ -1393,7 +1598,7 @@ class MainWindow(QMainWindow):
 
     def _on_worker_failed(self, message: str) -> None:
         self.progress.setVisible(False)
-        self.run_button.setEnabled(True)
+        self._finish_backtest_ui()
         self.statusBar().showMessage("Failed.")
         QMessageBox.critical(self, "Operation failed", message)
 
@@ -1564,8 +1769,19 @@ class MainWindow(QMainWindow):
 
     def _on_result_ready(self, result: Any) -> None:
         self.progress.setVisible(False)
-        self.run_button.setEnabled(True)
+        self._finish_backtest_ui()
         self.result = result
+
+        # A truncated run must never be mistaken for a complete one.
+        if getattr(result, "cancelled", False):
+            self.backtest_live_label.setText(
+                f"STOPPED EARLY - partial results from {len(result.snapshots):,} of "
+                f"{result.n_events:,} events. Metrics below describe the part that ran."
+            )
+        else:
+            self.backtest_live_label.setText(
+                f"Complete - {result.n_events:,} events replayed."
+            )
 
         _clear_layout(self.metric_row)
         for caption, value in presenter.headline_metrics(result):
