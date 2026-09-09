@@ -66,6 +66,90 @@ nothing to diff against. This file closes that gap.
 
 ---
 
+## 2026-09-08 - Real data at last: Manifold, and the self-improving loop
+
+**Status:** adopted. The central scientific blocker is cleared.
+
+### The blocker, and why Manifold clears it
+
+Every walk-forward training fold purged to zero on Kalshi because its settled
+markets live one to six hours and overlap heavily. Manifold's resolved binary
+markets have a **median lifetime of about 200 days** and resolve in a long
+sequence. Measured on 40 of them: fold 0 came back **usable, with 453
+out-of-sample rows** - the first usable fold this protocol has ever produced on
+real data.
+
+Manifold is play money, so an edge found there is not tradable. Accepted
+deliberately: the blocker being cleared is scientific, not financial.
+
+`adapters/manifold.py` is read-only by construction - GET-only transport, no
+credentials, raw bodies stored before parsing, and a test asserting the client
+has no write method.
+
+### The order-book problem, handled honestly
+
+Manifold is an AMM: one probability, no bid and no ask. The engine needs two
+sides, so the adapter **derives** them - the mid is the AMM probability, the
+half-spread is estimated from *observed price impact* (the median
+`|probAfter - probBefore|` across real bets), and displayed size is a liquidity
+proxy. Every such quote is stamped `MANIFOLD_AMM+IMPACT_SPREAD_PROXY` and the
+dataset carries a note, exactly as Kalshi's `depth_from_volume` does.
+
+Observed impact is usually below the 0.005 floor, so in practice the floor
+binds rather than the estimate. The floor exists because a market with no
+modelled cost looks free to trade, which would flatter every result.
+
+Notably: **zero rows dropped for one-sided books**, against 83% on Kalshi.
+
+### What "self-learning" means, and what it does not
+
+`research/autopilot.py` improves by **accumulating evidence**, not by tuning
+toward a number it likes. Each pass acquires more real resolved markets,
+rebuilds features and labels, retrains every candidate under walk-forward, and
+scores it out-of-sample against a frozen baseline.
+
+Earnings are feedback - but only earnings on markets the candidate was never
+fitted on. A loop that searched parameters and kept whatever maximised
+in-sample profit would find something every time, and that something would be
+noise. This is scope boundary 3 in the Mission, and the loop honours it: model
+hyper-parameters are never varied in response to a result, and an AST test
+asserts no approval function is ever called.
+
+### The guard automation needs and manual work does not
+
+Run enough candidates against the same test data and one looks good by luck:
+twenty draws at a 5% bar produce a false winner about two-thirds of the time.
+`TrialLedger` counts every evaluation and reports the bar a result would have to
+clear given how many things were tried. It adjusts nothing silently - it makes
+the cost of searching visible.
+
+### First real run
+
+Corpus grew 59 -> 119 -> 179 markets (175 resolved) across three batches.
+Trial 3 scored **30 out-of-sample markets across 1 usable fold**.
+
+**Brier 0.5452 against a market-price baseline of 0.1217.** The model is far
+worse than simply using the market price - and the baseline is genuinely strong,
+which is what a well-functioning prediction market looks like. Beating it is the
+entire bar, and nothing here is close.
+
+Gate failed on three of four checks. Nothing was promoted or approved.
+
+### A defect this run exposed
+
+The time budget was checked only at the top of each batch, so a 14-minute run
+took **3.3 hours**: one candidate evaluation cannot be interrupted once started,
+and the cost of rebuilding features grows with the corpus. The budget is now
+rechecked before each candidate, and a significant overrun is recorded on the
+report rather than passing silently.
+
+The deeper cost remains: every pass rebuilds features for the entire corpus.
+Incremental feature building is the fix and is not done.
+
+Verification: 815 passed, 4 skipped, exit 0. ruff clean.
+
+---
+
 ## 2026-09-08 - Simple mode, presets, and campaigns instead of single backtests
 
 **Status:** adopted.
@@ -469,7 +553,9 @@ entries above are not.
 | Job layer / app-as-product | **Done.** `core/jobs.py`; backtest, campaign and corpus loop all report progress and stop from the UI. | Extend to the Research tab's four stages, which still block without feedback. |
 | Learner-facing UI | **Done.** Simple mode by default (4 tabs, presets with expectations), Advanced toggle reveals everything. | Glossary surface for `presets.TERMS`; plain-language read-out on the Research tab. |
 | Evidence from backtests | **Campaigns.** Repeated resampled runs with a percentile band and a verdict that refuses to overclaim. | Run campaigns on a real corpus once a venue fills the folds. |
-| Manifold adapter | Not started. | Unblocks walk-forward with a corpus whose lifetimes actually fit the protocol. |
+| Manifold adapter | **Done and live.** Read-only, derived book stamped as a proxy. 39 tests. | Deeper paging; more markets to fill folds 2 and 3. |
+| Walk-forward on real data | **Unblocked.** First usable fold ever produced: 30 out-of-sample markets, 1 fold. | Reach 3 folds and 50 OOS markets - a volume problem now, not a protocol one. |
+| Self-improving loop | **Done.** `research/autopilot.py` acquires, retrains, scores out-of-sample, reports the gate, never approves. Trial ledger charges for repeated search. | Incremental feature building: every pass currently rebuilds the whole corpus. |
 | Polymarket adapter | Not started. | Real money, real book depth; addresses the 83% one-sided-book row loss. |
 | Research desk integration | `ResearchDeskAgent` exists behind `analyze()` but is not graded by walk-forward or visible in the app. | Wire into the harness so the personas are measured rather than asserted. |
 | Read-only Kalshi adapter | Working against the live venue. 50 tests remain fixture-only. | Guard the candlestick call inside `fetch_dataset` so one bad ticker skips itself. |
