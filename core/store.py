@@ -141,11 +141,24 @@ def read_dataset(db_path: str | Path) -> DemoDataset:
     if not path.exists():
         raise FileNotFoundError(f"no DuckDB file at {path}")
     with duckdb.connect(str(path), read_only=True) as con:
+        # DuckDB returns TIMESTAMPTZ in the *session* timezone, so the same file
+        # read in Denver and in London came back with different tzinfo - and a
+        # zone with DST can make a stored instant ambiguous. Pinning the session
+        # to UTC makes a read machine-independent, which the whole
+        # reproducibility claim depends on.
+        con.execute("SET TimeZone='UTC'")
         frames = {
             name: con.execute(f"SELECT * FROM {name}").fetch_df()
             for name in _MODEL_FIELDS
         }
         meta = con.execute("SELECT * FROM meta").fetch_df()
+
+    for frame in frames.values():
+        for column in ("ts", "created_at", "close_time", "resolution_time"):
+            if column in frame.columns:
+                values = frame[column]
+                if getattr(values.dtype, "tz", None) is not None:
+                    frame[column] = values.dt.tz_convert("UTC")
 
     markets = [Market.model_validate(r) for r in _clean_records(frames["markets"])]
     quotes = [Quote.model_validate(r) for r in _clean_records(frames["quotes"])]

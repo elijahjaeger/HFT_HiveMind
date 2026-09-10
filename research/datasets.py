@@ -191,6 +191,7 @@ def build_feature_dataset(
     dataset: MarketDataset,
     config: dict[str, Any] | None = None,
     venue_statuses: dict[str, str] | None = None,
+    cache: Any = None,
 ) -> FeatureDataset:
     """Build every causal feature row from a stored dataset.
 
@@ -199,6 +200,12 @@ def build_feature_dataset(
         config: The ``research.dataset`` settings section.
         venue_statuses: Raw venue status strings by market id, when available,
             so contested settlements can be excluded.
+        cache: Optional :class:`research.featurecache.FeatureCache`. Features
+            for one market are a pure function of that market's own series and
+            the grid config, so they cache per market. Without it, a growing
+            corpus recomputes everything on every pass - measured at hours for
+            179 markets, which makes the autopilot unusable exactly when it
+            starts working.
 
     Returns:
         A :class:`FeatureDataset` carrying its own provenance.
@@ -227,11 +234,24 @@ def build_feature_dataset(
         trades = trades_by_market.get(market.market_id, [])
         label = labels[market.market_id]
 
+        key: str | None = None
+        if cache is not None:
+            from research.featurecache import cache_key
+
+            key = cache_key(
+                market.market_id, quotes, trades, cfg, label.policy_version
+            )
+            cached = cache.get(key)
+            if cached is not None:
+                examples.extend(cached)
+                continue
+
         stamps = decision_timestamps(market, quotes, horizon, stride)
         if not stamps:
             skipped["market_shorter_than_horizon"] += 1
             continue
 
+        built: list[TrainingExample] = []
         for decision_ts in stamps:
             vector = build_features(market, quotes, trades, decision_ts, cfg)
             if vector is None:
@@ -246,7 +266,7 @@ def build_feature_dataset(
                 skipped["outcome_already_known"] += 1
                 usable = False
 
-            examples.append(
+            built.append(
                 TrainingExample(
                     market_id=market.market_id,
                     decision_ts=decision_ts,
@@ -256,6 +276,10 @@ def build_feature_dataset(
                     market_prob=vector.values["market_prob"],
                 )
             )
+
+        examples.extend(built)
+        if cache is not None and key is not None:
+            cache.store(key, market.market_id, built)
 
     examples.sort(key=lambda e: (e.decision_ts, e.market_id))
     return FeatureDataset(

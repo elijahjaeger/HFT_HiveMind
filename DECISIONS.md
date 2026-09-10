@@ -66,6 +66,215 @@ nothing to diff against. This file closes that gap.
 
 ---
 
+## 2026-09-09 - Phase 0 complete: the gate now evaluates real evidence
+
+**Status:** adopted. Phase 0's exit gate is met.
+
+```
+OK  Real market data
+OK  Usable walk-forward folds            have=3    need=3
+OK  Independent out-of-sample markets    have=87   need=50
+--  Beats frozen baseline                have=no
+```
+
+Three of four gate checks pass on real Manifold data, in **92 seconds**. Only
+the fourth remains, and that is Phase 1's whole question.
+
+### The finding: concurrency, not lifetime
+
+Manifold was chosen because its markets live ~200 days rather than Kalshi's 1-6
+hours. That reasoning was **wrong**, or at least incomplete. Growing the corpus
+179 -> 286 markets made things *worse*: usable folds went from 1 to **0**.
+
+Measured on the 286-market corpus: **115 concurrent markets**. Fold 1 had
+`train=121, test=30` and still produced **zero rows** after purging, because
+with that much overlap essentially every training market resolves after the test
+window opens.
+
+Capping market lifetime fixes it, because lifetime is the lever that controls
+concurrency:
+
+| max lifetime | markets | concurrent | usable folds | OOS markets |
+| --- | --- | --- | --- | --- |
+| 30 days | 49 | 5 | 3/3 | 24 |
+| 60 days | 80 | 14 | 3/3 | 36 |
+| 120 days | 116 | 21 | 3/3 | 60-87 |
+| unbounded | 286 | **115** | **0/3** | 0 |
+
+So both venues failed for the same underlying reason and it was never lifetime:
+**the purge requires markets that resolve sequentially.** `research/corpus.py`
+said this from the beginning - its working synthetic corpus is described as "~7
+concurrent" - and it took two venues to notice.
+
+`AutopilotConfig.max_lifetime_days` defaults to 120. Filtering happens at
+discovery (so useless markets are never fetched) and again on the cached corpus
+(so a cache built before the cap does not push concurrency back up).
+
+### Speed: 242s -> 12.9s per pass
+
+A 14-minute run had taken 3.3 hours. Profiling found the cost was not where it
+seemed:
+
+* **`run_model_backtest` was 69%** (168s). The simulator ticked every 600s on
+  markets living months while the model emitted one forecast per stride, so 143
+  of every 144 decisions re-evaluated an unchanged forecast. Aligning
+  `decision_interval_seconds` to the forecast stride is a correctness fix as
+  much as a speed one.
+* **Feature building was 29%** (71s). `research/featurecache.py` caches rows per
+  market, keyed on feature version, label policy, the full grid config and a
+  fingerprint of the market's own series, so any change rebuilds. Measured 98%
+  hit rate; cached and uncached builds are asserted identical.
+
+I optimised feature building first and it was the smaller half. Recorded because
+the profile contradicted the guess.
+
+### Two bugs found in passing
+
+* **`core/store.py` returned local-time timestamps.** DuckDB hands back
+  `TIMESTAMPTZ` in the session timezone, so the same file read on two machines
+  produced different `tzinfo` - and `America/Denver` has DST, making instants
+  near a boundary ambiguous. Reads are now pinned to UTC. Nothing was
+  numerically wrong (instant comparisons still held), but the reproducibility
+  claim was.
+* **The autopilot only trained after a successful acquisition.** A run resuming
+  from the 286-market cache with no new markets reported "no candidate was
+  evaluated" while holding all of them. Acquisition and evaluation are now
+  decoupled: a cached corpus is scored once, then the loop stops with
+  `NO_NEW_MARKETS` rather than re-scoring unchanged data.
+
+The project's own AST order-placement scan also caught the feature cache's
+`put()` method, because a bare `put()` reads as an HTTP write verb. Renamed to
+`store()` rather than weakening the guard.
+
+### Where the model actually stands
+
+Candidate Brier across today's fixes: **0.5452 -> 0.2390 -> 0.1729**. The
+market-price baseline is **0.0802**.
+
+The model improved threefold and is still **2.2x worse than simply using the
+market price**. A Brier of 0.0802 is an exceptionally well-calibrated
+forecaster, which is what a functioning prediction market looks like. The gap to
+close is 0.0927 Brier, and no amount of tuning the existing 13 price-derived
+features will close it, because none of them carries information the price does
+not already contain.
+
+That is Phase 1, and the stopping rule recorded above governs it.
+
+Verification: 839 passed, 4 skipped, exit 0. ruff clean.
+
+---
+
+## 2026-09-09 - Road to income: phased plan, and a pre-committed stopping rule
+
+**Status:** adopted. Written **before** the work begins, deliberately.
+
+### The finding that shapes everything
+
+All 13 features in `features-v1` are derived from price and book:
+`market_prob`, `spread`, `depth_imbalance`, returns, volatility, volume,
+time-to-close. **Nothing in the feature set carries information the market
+price does not already contain.**
+
+The model is therefore trying to beat a price using only that price and its own
+history, which in a functioning market is close to impossible. Measured on real
+Manifold data: **Brier 0.5452 against a market-price baseline of 0.1217.** That
+is not an under-tuned model; it is a model with no information.
+
+Any edge must come from information the market has not priced. That is what
+Phase 1 below is for, and it is the whole project in one question.
+
+### The cost hurdle, stated plainly
+
+Per round trip on Kalshi: fees `0.07 x p x (1-p)` (~1.75% of notional at
+p=0.50), half the spread (~0.75%), plus slippage and queue position (0.5-1%,
+and worse than modelled while the book is candle-derived).
+
+**Round-trip cost is roughly 3-5% of notional.** A 2% mispricing is worthless.
+Only markets mispriced by 5% or more are worth acting on, and then only if we
+are right repeatedly across independent outcomes.
+
+### The phases
+
+Each has a falsifiable exit gate. Every gate before Phase 5 costs time only.
+
+| Phase | Work | Exit gate |
+| --- | --- | --- |
+| **0** | ~~Incremental feature building; deeper Manifold paging~~ **DONE 2026-09-09** | ~~Gate evaluates a real candidate on >=50 independent OOS markets across 3 folds~~ **MET: 87 markets, 3 folds** |
+| **1** | Feature families carrying information the price lacks | A candidate beats the frozen market-price baseline OOS by more than fold-to-fold variation |
+| **2** | Kalshi orderbook depth; re-score under real costs | Cost-adjusted OOS return positive with the confidence band clear of zero |
+| **3** | Settlement detection; live paper trading | >=3 months, realised calibration matching backtest, no material drift |
+| **4** | Execution application, **separate repository** | Reconciles exactly against exchange records in sandbox; kill switch tested |
+| **5** | Minimum viable capital | 3 months live matching paper before any increase |
+
+A parallel workstream covers venue legality, position limits, tax treatment and
+record-keeping. Those need answers before Phase 4, not during it.
+
+### Phase 1 order, and why
+
+1. **Base rates by reference class.** Attacks the favourite-longshot bias, the
+   most replicated mispricing in betting markets. Buildable from resolved
+   markets already collected, and it fills the seat `agents/baseline.py` has
+   held open as an acknowledged placeholder since the start.
+2. **Cross-market consistency.** The only candidate requiring no forecast: if
+   `P(A and B) > P(A)`, that is arithmetic, not prediction. Highest confidence
+   per signal when it exists.
+3. **Neglected / illiquid markets.** Where mispricing most plausibly survives,
+   but where the cost hurdle is highest.
+4. **External data** (weather, sport, economic releases). Highest ceiling, most
+   work, and a new source per market family.
+
+Sequenced rather than attempted together, because each family is another draw
+against the same test data.
+
+### THE STOPPING RULE
+
+Pre-committed, and binding. Its purpose is to make the decision to stop while
+nothing is at stake, rather than after a run that looks promising.
+
+**Unit of attempt:** one *feature family* - a distinct information source. A
+model variant, a hyper-parameter change or a re-run of a failed family is **not**
+a new attempt.
+
+**Budget:** four feature families.
+
+**Each family must be tested on** >=50 independent resolved out-of-sample
+markets across >=3 usable walk-forward folds.
+
+**Success for a family:** beats the frozen market-price baseline on
+out-of-sample Brier by more than the fold-to-fold standard deviation of that
+difference, at a per-family bar of `0.05 / (families tried)`.
+
+**If all four families fail: Phase 1 returns NO. The project stops pursuing
+income.** The result is recorded here, `README.md` is updated to say so, and no
+capital is ever committed.
+
+**Explicitly forbidden**, because these are the moves people actually make:
+
+- Retrying a failed family with different hyper-parameters and counting it as a
+  new family.
+- Extending the budget beyond four after seeing results.
+- Lowering the >=50-market or >=3-fold requirement to let a result through.
+- Treating a near-miss as a pass.
+- Proceeding to Phase 2 on in-sample or resampled evidence. A campaign measures
+  robustness to market selection, never out-of-sample validity.
+
+Every family's result is recorded whether it passes or fails, so the count is
+auditable rather than remembered.
+
+### The honest expectation
+
+Six to twelve months to a first dollar if everything works. The base rate for
+retail quant strategies reaching profitability is low, prediction-market fees
+are unusually punishing for small edges, and the current model has no signal at
+all.
+
+**The most probable outcome is that Phase 1 returns NO.** That is a successful
+use of this project, not a failure of it: it will have cost time and no money,
+and the alternative - discovering the same thing with capital at risk - is the
+outcome every guard in this codebase exists to prevent.
+
+---
+
 ## 2026-09-08 - Real data at last: Manifold, and the self-improving loop
 
 **Status:** adopted. The central scientific blocker is cleared.

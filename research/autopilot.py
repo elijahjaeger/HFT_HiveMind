@@ -78,16 +78,28 @@ class AutopilotConfig:
     target_folds: int = 3
     candidates: tuple[str, ...] = DEFAULT_CANDIDATES
 
+    max_lifetime_days: float = 120.0
+    """Cap on how long an acquired market may have been open.
+
+    Controls **concurrency**, which is what the walk-forward purge depends on -
+    not quality. Measured on 286 Manifold markets: unbounded lifetimes gave 115
+    concurrent and **zero** usable folds even where a fold had 121 training
+    markets. A 120-day cap gave 21 concurrent, 3 usable folds and 60
+    out-of-sample markets from the same data.
+    """
+
     cache_path: str = "data/processed/manifold_corpus.duckdb"
+    feature_cache_path: str = "data/processed/feature_cache.duckdb"
+    use_feature_cache: bool = True
     max_bet_pages: int = 1
 
     # Long-lived markets need a coarse decision grid. A market that lives 200
     # days would otherwise produce ~10,000 rows on a 30-minute stride, none of
     # which carry independent information.
-    stride_seconds: float = 86_400.0
-    horizon_seconds: float = 86_400.0
-    short_window_seconds: float = 172_800.0
-    long_window_seconds: float = 604_800.0
+    stride_seconds: float = 21_600.0
+    horizon_seconds: float = 21_600.0
+    short_window_seconds: float = 43_200.0
+    long_window_seconds: float = 172_800.0
 
 
 @dataclass(frozen=True)
@@ -284,7 +296,9 @@ def acquire_batch(
     from adapters.manifold import ManifoldFetchSpec
 
     try:
-        listed = adapter.discover(limit=100, offset=offset)
+        listed = adapter.discover(
+            limit=100, offset=offset, max_lifetime_days=config.max_lifetime_days
+        )
     except (AdapterError, OSError) as error:
         if errors is not None:
             errors.append(f"discover: {type(error).__name__}: {error}")
@@ -307,6 +321,35 @@ def acquire_batch(
         return None
 
 
+def within_lifetime(corpus: MarketDataset, max_days: float | None) -> MarketDataset:
+    """Drop markets that were open longer than ``max_days``.
+
+    Applied to the cached corpus as well as to discovery, because a cache built
+    before the cap was introduced still holds markets that would push
+    concurrency back up and empty the folds again.
+    """
+    if max_days is None:
+        return corpus
+    keep = {
+        m.market_id
+        for m in corpus.markets
+        if (m.close_time - m.created_at).total_seconds() / 86400.0 <= max_days
+    }
+    if len(keep) == len(corpus.markets):
+        return corpus
+    return MarketDataset(
+        markets=[m for m in corpus.markets if m.market_id in keep],
+        quotes=[q for q in corpus.quotes if q.market_id in keep],
+        trades=[t for t in corpus.trades if t.market_id in keep],
+        seed=corpus.seed,
+        label=corpus.label,
+        source=corpus.source,
+        venue=corpus.venue,
+        fetched_at=corpus.fetched_at,
+        notes=list(corpus.notes),
+    )
+
+
 def research_settings(settings: dict[str, Any], config: AutopilotConfig) -> dict[str, Any]:
     """Settings with a decision grid sized for long-lived markets.
 
@@ -325,6 +368,16 @@ def research_settings(settings: dict[str, Any], config: AutopilotConfig) -> dict
             "long_window_seconds": config.long_window_seconds,
         },
     }
+    # The simulator must tick no faster than the model forecasts. At the shipped
+    # 600s interval a market living 200 days gets ~28,800 decision ticks while
+    # the model emits one forecast per daily stride, so 143 of every 144 ticks
+    # re-evaluate a forecast that has not changed. Measured: the backtest was
+    # 69% of a pass (168s of 242s). Aligning the two is a correctness fix as
+    # much as a speed one - a stale forecast is not a new decision.
+    merged["backtest"] = {
+        **settings.get("backtest", {}),
+        "decision_interval_seconds": config.stride_seconds,
+    }
     return merged
 
 
@@ -339,9 +392,10 @@ def evaluate_candidate(
     model_name: str,
     index: int,
     registry: ResearchRegistry | None = None,
+    cache: Any = None,
 ) -> Trial:
     """Train one candidate and score it out-of-sample. Never approves."""
-    prepared = prepare_data(corpus, settings, registry)
+    prepared = prepare_data(corpus, settings, registry, cache=cache)
     outcome = train_and_evaluate(prepared, settings, model_name, registry)
     gate = outcome.gate
 
@@ -408,6 +462,12 @@ def run_autopilot(
     tuned = research_settings(settings, cfg)
     venue_adapter = adapter or build_adapter(cfg.venue, settings)
 
+    feature_cache = None
+    if cfg.use_feature_cache:
+        from research.featurecache import FeatureCache
+
+        feature_cache = FeatureCache(cfg.feature_cache_path)
+
     def say(message: str) -> None:
         if on_status is not None:
             on_status(message)
@@ -433,18 +493,24 @@ def run_autopilot(
             venue_adapter, cfg.venue, seen, cfg, offset, report.errors
         )
         offset += 100
-        if fetched is None:
-            if corpus is None:
-                report.stopped_because = StopReason.NO_DATA
-                break
-            if offset > 100 * cfg.max_batches:
-                report.stopped_because = StopReason.NO_NEW_MARKETS
-                break
-            continue
+        if fetched is None and corpus is None:
+            report.stopped_because = StopReason.NO_DATA
+            break
 
-        corpus = merge_corpora(corpus, fetched)
-        seen.update(m.market_id for m in corpus.markets)
-        write_dataset(corpus, cfg.cache_path)
+        if fetched is not None:
+            corpus = merge_corpora(corpus, fetched)
+            seen.update(m.market_id for m in corpus.markets)
+            write_dataset(corpus, cfg.cache_path)
+        elif report.trials:
+            # Nothing new, and the corpus as it stands has already been
+            # evaluated. Anything further would be another draw against the
+            # same data, which the ledger would rightly charge for.
+            report.stopped_because = StopReason.NO_NEW_MARKETS
+            break
+        # A batch that acquired nothing still falls through to evaluation the
+        # first time: a cached corpus is evidence, and refusing to score it
+        # meant a resumed run reported "no candidate was evaluated" while
+        # holding 286 markets.
         report.batches = batch
         report.corpus_markets = len(corpus.markets)
         say(f"Corpus now {len(corpus.markets)} market(s). Training...")
@@ -467,8 +533,12 @@ def run_autopilot(
             if spent >= cfg.duration_seconds:
                 report.stopped_because = StopReason.MAX_ITERATIONS
                 break
+            # The cache is kept whole on disk; only what we evaluate is
+            # filtered, so raising the cap later needs no refetch.
+            usable = within_lifetime(corpus, cfg.max_lifetime_days)
             trial = evaluate_candidate(
-                corpus, tuned, model_name, len(report.trials) + 1, registry
+                usable, tuned, model_name, len(report.trials) + 1, registry,
+                cache=feature_cache,
             )
             report.trials.append(trial)
             report.ledger.record(trial)
@@ -486,6 +556,12 @@ def run_autopilot(
     report.elapsed = time.monotonic() - started
     if corpus is not None:
         report.corpus_markets = len(corpus.markets)
+    if feature_cache is not None:
+        report.notes.append(
+            f"Feature cache: {feature_cache.stats.hits} market(s) reused, "
+            f"{feature_cache.stats.misses} rebuilt "
+            f"({feature_cache.stats.hit_rate:.0%} hit rate)."
+        )
     if report.elapsed > cfg.duration_seconds * 1.5:
         report.notes.append(
             f"Ran {report.elapsed:.0f}s against a {cfg.duration_seconds:.0f}s budget. "

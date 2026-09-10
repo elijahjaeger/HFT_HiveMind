@@ -105,15 +105,41 @@ def map_outcome(resolution: Any) -> Outcome | None:
     return RESOLVED_OUTCOMES.get(str(resolution).upper())
 
 
-def is_usable_binary(payload: dict[str, Any]) -> bool:
-    """Whether a listed market can contribute a labelled example."""
+def market_lifetime_days(payload: dict[str, Any]) -> float | None:
+    """How long a listed market was open, in days, or ``None`` if unknown."""
+    opened = parse_timestamp(payload.get("createdTime"))
+    closed = parse_timestamp(payload.get("closeTime"))
+    if opened is None or closed is None:
+        return None
+    return (closed - opened).total_seconds() / 86400.0
+
+
+def is_usable_binary(
+    payload: dict[str, Any], max_lifetime_days: float | None = None
+) -> bool:
+    """Whether a listed market can contribute a labelled example.
+
+    ``max_lifetime_days`` bounds how long a market may have been open. That is
+    not a quality filter - it controls **concurrency**, which is what the
+    walk-forward purge actually depends on. Measured on 286 Manifold markets:
+    unbounded lifetimes gave 115 concurrent markets and **zero** usable folds
+    even where a fold had 121 training markets, because every training market
+    resolved after the test window opened. Capping lifetime at 120 days gave 21
+    concurrent and 3 usable folds from the same data.
+    """
     if str(payload.get("outcomeType", "")).upper() != "BINARY":
         return False
     if not payload.get("isResolved"):
         return False
     if str(payload.get("resolution", "")).upper() in EXCLUDED_RESOLUTIONS:
         return False
-    return map_outcome(payload.get("resolution")) is not None and bool(payload.get("id"))
+    if map_outcome(payload.get("resolution")) is None or not payload.get("id"):
+        return False
+    if max_lifetime_days is not None:
+        lifetime = market_lifetime_days(payload)
+        if lifetime is None or lifetime > max_lifetime_days:
+            return False
+    return True
 
 
 def normalize_market(payload: dict[str, Any], fee_rate: float = 0.0) -> Market:
@@ -403,10 +429,19 @@ class ManifoldAdapter:
             notes=notes,
         )
 
-    def discover(self, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
-        """Resolved binary markets that can produce a labelled example."""
+    def discover(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        max_lifetime_days: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Resolved binary markets that can produce a labelled example.
+
+        ``max_lifetime_days`` filters here rather than after fetching, so
+        markets that would only raise concurrency are never pulled at all.
+        """
         try:
             listed = self.client.search_resolved_binary(limit=limit, offset=offset)
         except (AdapterError, OSError):
             return []
-        return [m for m in listed if is_usable_binary(m)]
+        return [m for m in listed if is_usable_binary(m, max_lifetime_days)]

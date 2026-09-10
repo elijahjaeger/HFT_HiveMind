@@ -106,6 +106,7 @@ def prepare_data(
     corpus: MarketDataset,
     settings: dict[str, Any],
     registry: ResearchRegistry | None = None,
+    cache: Any = None,
 ) -> PreparedData:
     """Stage 1: build causal features and settlement labels.
 
@@ -113,12 +114,16 @@ def prepare_data(
         corpus: The source market data.
         settings: Full settings dictionary.
         registry: Where to record the run, if recording is wanted.
+        cache: Optional feature cache, so a growing corpus does not rebuild
+            rows it has already built.
 
     Returns:
         A :class:`PreparedData` carrying the dataset and its readiness verdict.
     """
     research_cfg = settings.get("research", {})
-    dataset = build_feature_dataset(corpus, research_cfg.get("dataset", {}))
+    dataset = build_feature_dataset(
+        corpus, research_cfg.get("dataset", {}), cache=cache
+    )
     info = describe(corpus)
     readiness = check_readiness(dataset, research_cfg.get("readiness", {}))
     fingerprint = dataset_fingerprint(dataset)

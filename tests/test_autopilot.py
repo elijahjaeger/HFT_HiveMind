@@ -93,13 +93,19 @@ def test_the_ledger_counts_every_evaluation():
 # --------------------------------------------------------------------------
 
 
-def test_long_lived_markets_get_a_coarse_decision_grid(settings):
-    """A 200-day market on a 30-minute stride yields ~10,000 dependent rows."""
+def test_the_grid_is_coarser_than_the_shipped_default(settings):
+    """Real markets live weeks, not the hours the shipped grid assumes.
+
+    The shipped 30-minute stride produces thousands of rows per market that
+    share one resolved outcome between them. The grid is sized to the lifetime
+    cap instead - coarser than the default, but far finer than the daily stride
+    that was tried first and mismatched a 20-day market.
+    """
     tuned = research_settings(settings, AutopilotConfig())
-    dataset_cfg = tuned["research"]["dataset"]
-    assert dataset_cfg["stride_seconds"] == 86_400
-    assert dataset_cfg["horizon_seconds"] == 86_400
-    assert dataset_cfg["stride_seconds"] > settings["research"]["dataset"]["stride_seconds"]
+    grid = tuned["research"]["dataset"]
+    assert grid["stride_seconds"] > settings["research"]["dataset"]["stride_seconds"]
+    assert grid["stride_seconds"] < 86_400, "a daily stride was too coarse"
+    assert grid["horizon_seconds"] == grid["stride_seconds"]
 
 
 def test_tuning_the_grid_does_not_touch_the_promotion_gate(settings):
@@ -242,7 +248,9 @@ class StubAdapter:
         self.batch = batch
         self.served = 0
 
-    def discover(self, limit: int = 100, offset: int = 0) -> list[dict]:
+    def discover(
+        self, limit: int = 100, offset: int = 0, max_lifetime_days=None
+    ) -> list[dict]:
         ids = [m.market_id for m in self.corpus.markets]
         window = ids[self.served : self.served + self.batch]
         return [{"id": i} for i in window]
@@ -375,3 +383,129 @@ def test_the_budget_is_checked_before_each_candidate_not_only_each_batch():
     before_loop = source.index("for model_name in cfg.candidates")
     after = source[before_loop:]
     assert "duration_seconds" in after, "the budget must be rechecked per candidate"
+
+
+# --------------------------------------------------------------------------
+# Concurrency, not lifetime, is what the purge depends on
+# --------------------------------------------------------------------------
+
+
+def test_the_lifetime_cap_is_configured_by_default():
+    """Unbounded lifetimes gave 115 concurrent markets and zero usable folds."""
+    assert AutopilotConfig().max_lifetime_days == 120.0
+
+
+def test_the_decision_grid_fits_the_lifetime_cap(settings):
+    """A daily stride on a 20-day market yields ~19 rows, most of them stale."""
+    config = AutopilotConfig()
+    tuned = research_settings(settings, config)
+    stride_days = tuned["research"]["dataset"]["stride_seconds"] / 86_400
+    assert stride_days < config.max_lifetime_days / 10
+
+
+def test_long_lived_markets_are_dropped_from_an_existing_corpus():
+    """A cache built before the cap still holds markets that empty the folds."""
+    from research.autopilot import within_lifetime
+
+    corpus = _corpus(10)
+    kept = within_lifetime(corpus, max_days=0.0)
+    assert kept.markets == []
+    assert kept.quotes == []
+
+
+def test_filtering_preserves_provenance():
+    """A filtered corpus must still read as real, or the gate fails wrongly."""
+    from research.autopilot import within_lifetime
+    from research.corpus import describe
+
+    corpus = _corpus(10)
+    kept = within_lifetime(corpus, max_days=10_000.0)
+    assert describe(kept).is_synthetic is False
+    assert kept.label == corpus.label
+    assert kept.venue == corpus.venue
+
+
+def test_no_cap_returns_the_corpus_untouched():
+    from research.autopilot import within_lifetime
+
+    corpus = _corpus(6)
+    assert within_lifetime(corpus, None) is corpus
+
+
+def test_filtering_keeps_only_the_quotes_of_kept_markets():
+    """Quotes must follow their markets through the filter.
+
+    The synthetic generator gives every market the same lifetime, so the cap is
+    set from the actual value rather than from a quantile that cannot split.
+    """
+    from research.autopilot import within_lifetime
+
+    corpus = _corpus(12)
+    lifetime = (
+        corpus.markets[0].close_time - corpus.markets[0].created_at
+    ).total_seconds() / 86400.0
+
+    kept = within_lifetime(corpus, lifetime * 2)
+    assert len(kept.markets) == len(corpus.markets), "all are inside a generous cap"
+
+    dropped = within_lifetime(corpus, lifetime / 2)
+    assert dropped.markets == [], "all are outside a tight cap"
+    assert dropped.quotes == []
+
+    kept_ids = {m.market_id for m in kept.markets}
+    assert all(q.market_id in kept_ids for q in kept.quotes)
+    for market in kept.markets:
+        span = (market.close_time - market.created_at).total_seconds() / 86400.0
+        assert span <= lifetime * 2
+
+
+def test_a_cached_corpus_is_evaluated_even_when_nothing_new_arrives(
+    monkeypatch, settings, tmp_path
+):
+    """A resumed run must score what it already has.
+
+    The loop originally trained only after a successful acquisition, so a run
+    resuming from a 286-market cache that found no new markets reported "no
+    candidate was evaluated" while holding all of them.
+    """
+    import research.autopilot as module
+
+    cache = tmp_path / "c.duckdb"
+    corpus = _corpus(14)
+    from core.store import write_dataset
+
+    write_dataset(corpus, cache)
+
+    monkeypatch.setattr(module, "acquire_batch", lambda *a, **k: None)
+    config = AutopilotConfig(
+        duration_seconds=120.0, max_batches=3, cache_path=str(cache),
+        max_lifetime_days=None, use_feature_cache=False,
+    )
+    config = type(config)(**{**config.__dict__, "candidates": ("logistic_regression",)})
+    report = run_autopilot(settings, config, adapter=StubAdapter(corpus))
+
+    assert report.trials, "a cached corpus must still be scored"
+    assert report.corpus_markets == len(corpus.markets)
+
+
+def test_a_second_empty_batch_stops_rather_than_re_scoring(
+    monkeypatch, settings, tmp_path
+):
+    """Re-scoring unchanged data is another draw the ledger would charge for."""
+    import research.autopilot as module
+
+    cache = tmp_path / "c.duckdb"
+    corpus = _corpus(12)
+    from core.store import write_dataset
+
+    write_dataset(corpus, cache)
+    monkeypatch.setattr(module, "acquire_batch", lambda *a, **k: None)
+
+    report = run_autopilot(
+        settings,
+        AutopilotConfig(duration_seconds=120.0, max_batches=5, cache_path=str(cache),
+                        max_lifetime_days=None, use_feature_cache=False),
+        adapter=StubAdapter(corpus),
+    )
+    assert report.stopped_because is StopReason.NO_NEW_MARKETS
+    assert len(report.trials) == 1, "scored once, then stopped"
